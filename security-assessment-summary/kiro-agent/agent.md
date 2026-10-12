@@ -24,8 +24,8 @@ Follow these 9 steps in order. Do NOT skip any step (especially the PPTX deck).
 > Specifically: (1) do not copy `REMEDIATION_CODE_*` or finding text into generated `.tf`
 > (HCL injection) — Terraform comes only from the generator's vetted static catalog;
 > (2) HTML-escape finding-derived values before writing them into dashboard markup/scripts
-> (XSS); (3) never pass scan-derived values (including the customer name) unquoted into a
-> shell command — always single-quote them and prefer passing them as script arguments
+> (XSS); (3) never interpolate scan-derived values (including the customer name) into shell
+> command text. Pass them as direct argv elements or runtime-provided environment values
 > (command injection).
 
 ### Step 1: Gather Input & Output Paths
@@ -228,7 +228,7 @@ IaC output is **Terraform only**. Present the user with a multi-select of
 provider-neutral remediation capabilities (the generator emits the correct
 provider block per detected cloud):
 - `object_storage_public_access` - block public access + encryption
-- `identity_mfa` - enforce multi-factor authentication
+- `identity_mfa` - enforce multi-factor authentication (AWS/Azure only — GCP/OCI have no MFA module; offer `iam_least_privilege` / `iam_policy` there as least-privilege, not MFA)
 - `network_ingress` - restrict unrestricted ingress (no 0.0.0.0/0)
 - `disk_db_encryption` - encryption at rest for disks and databases
 - `audit_logging` - management/activity logs (multi-region)
@@ -259,6 +259,11 @@ Run:
 ```bash
 python3 ../python-script/scripts/generate_iac.py "<output_dir>/analysis.json" "<selections>" "<output_dir>/iac/"
 ```
+
+If the generator refuses because `iac/` holds Terraform files it did not generate, or
+generated files were edited, STOP and show the user the list. Never add `--force` or
+`--keep-existing-terraform` yourself: unknown files in a folder inside the customer's
+input may be planted, and Terraform would execute them on `plan`.
 
 Force a specific provider with `--provider aws|azure|gcp|oci` if needed.
 
@@ -317,6 +322,15 @@ Generated deliverables (output/):
 Providers: <detected> | Security Score: XX%
 Critical: X | High: X | Medium: X | Low: X [| Other: X when non-zero]
 ```
+
+**Partial results:** read `metadata.input_limits_applied` from `analysis.json`. If it is
+non-empty, start the summary with "PARTIAL RESULTS — some input was skipped by safety
+limits; findings and score may be incomplete" and list each entry. (The dashboard,
+README, PDF and deck show the same warning automatically.)
+
+**IaC rollback:** tell the user to capture current settings before `terraform apply`
+and to follow the README's targeted rollback — never plain `terraform destroy`, which
+removes pre-existing account-wide settings the modules took over.
 
 ## Key Rules
 

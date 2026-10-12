@@ -45,6 +45,8 @@ cd scripts && npm install
 IN=./prowler-output
 OUT=./output
 CUST="Acme Corp"
+# A safe filename component; keep the original CUST only for display/--customer.
+CUST_SLUG="$(printf '%s' "$CUST" | tr -cs 'A-Za-z0-9_-' '_')"
 
 # 1. Analyze
 python3 scripts/analyze_security_data.py "$IN" "$OUT/analysis.json" --customer "$CUST"
@@ -62,19 +64,19 @@ python3 scripts/analyze_security_data.py "$IN" "$OUT/analysis.json" --customer "
 python3 scripts/generate_charts.py "$OUT/analysis.json" "$OUT/charts/"
 
 # 3. Dashboard
-python3 scripts/generate_dashboard.py "$OUT/analysis.json" "$OUT/reports/${CUST}_Security_Dashboard.html"
+python3 scripts/generate_dashboard.py "$OUT/analysis.json" "$OUT/reports/${CUST_SLUG}_Security_Dashboard.html"
 
 # 4. Deck
-cd scripts && node generate_pptx.js "../$OUT/analysis.json" "../$OUT/charts/" "../$OUT/reports/${CUST}_Security_Assessment_Deck.pptx" && cd ..
+cd scripts && node generate_pptx.js "../$OUT/analysis.json" "../$OUT/charts/" "../$OUT/reports/${CUST_SLUG}_Security_Assessment_Deck.pptx" && cd ..
 
 # 5. Terraform IaC (provider auto-detected from analysis.json; override with --provider)
 python3 scripts/generate_iac.py "$OUT/analysis.json" "s3_public_access,iam_mfa,audit_logging" "$OUT/iac/"
 
 # 6. README
-python3 scripts/generate_readme.py "$OUT/analysis.json" "$OUT/${CUST}_README.md"
+python3 scripts/generate_readme.py "$OUT/analysis.json" "$OUT/${CUST_SLUG}_README.md"
 
 # 7. PDF (charts embedded)
-python3 scripts/generate_pdf.py "$OUT/analysis.json" "$OUT/${CUST}_Security_Remediation_Plan.pdf" --charts "$OUT/charts/"
+python3 scripts/generate_pdf.py "$OUT/analysis.json" "$OUT/${CUST_SLUG}_Security_Remediation_Plan.pdf" --charts "$OUT/charts/"
 ```
 
 ## Output structure

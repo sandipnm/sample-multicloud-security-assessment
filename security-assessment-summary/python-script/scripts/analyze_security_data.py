@@ -24,6 +24,7 @@ import csv
 import json
 import os
 import re
+import stat
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -41,14 +42,18 @@ import safe_io
 # hostile input can't drive unbounded memory use (DoS). The caps below also bound the
 # per-file size we are willing to read.
 MAX_FIELD_BYTES = 16 * 1024 * 1024          # 16 MiB per CSV field (generous for Prowler)
-MAX_FILE_BYTES = 512 * 1024 * 1024          # 512 MiB per input file
-MAX_JSON_FILE_BYTES = 256 * 1024 * 1024     # 256 MiB per JSON file (fully loaded into memory)
+MAX_FILE_BYTES = 512 * 1024 * 1024          # 512 MiB per CSV/HTML input file
+MAX_JSON_FILE_BYTES = 32 * 1024 * 1024      # 32 MiB per JSON file (fully loaded into memory)
+MAX_HTML_FILE_BYTES = 32 * 1024 * 1024      # 32 MiB per HTML file (fully loaded into memory)
+MAX_CSV_HEADER_BYTES = 64 * 1024             # 64 KiB cap before CSV classification
 
 # Aggregate (whole-job) limits — bound total work so a hostile input tree can't exhaust
 # memory/time even when every individual file is under the per-file caps above.
 MAX_TOTAL_FILES = 10_000                     # max files discovered/categorized in one run
+MAX_TOTAL_INPUT_PATHS = 50_000               # max files + directories visited in one run
 MAX_RECURSION_DEPTH = 32                     # max directory depth below the input root
 MAX_TOTAL_RECORDS = 5_000_000               # max normalized findings aggregated per run
+MAX_RECORDS_PER_FILE = 100_000               # per-file cap before parser lists grow unbounded
 
 try:
     csv.field_size_limit(MAX_FIELD_BYTES)
@@ -67,13 +72,49 @@ def _file_too_large(filepath, limit_bytes: int) -> bool:
     if size > limit_bytes:
         print(f"  [WARN] Skipping {filepath}: {size} bytes exceeds limit "
               f"({limit_bytes} bytes).", file=sys.stderr)
-        _PARSE_WARNINGS.append(f"Skipped oversized file {filepath} ({size} bytes)")
+        # A deliberate limit, not a parse failure: record it as a partial-results notice
+        # (non-fatal) rather than a parse warning (which aborts the run).
+        _LIMIT_NOTICES.append("oversized input file skipped")
         return True
     return False
 
 
 # Collects errors from selected inputs so main() can reject incomplete analyses.
 _PARSE_WARNINGS = []
+
+# Collects deliberate safety-limit hits (oversized file skipped, file/record caps reached).
+# These are NOT parse failures: the run continues, prints a PARTIAL RESULTS warning, and
+# records a path-free summary in metadata.input_limits_applied so deliverables show it.
+_LIMIT_NOTICES = []
+
+
+def _open_input_file(filepath, binary: bool = False):
+    """Open an ordinary input file without following a final symlink.
+
+    The descriptor is validated after open so a CSV discovered as a regular file
+    cannot be swapped to a FIFO, device, or final-component symlink before parsing.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(filepath, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"refusing non-regular input file: {filepath}")
+        mode = "rb" if binary else "r"
+        kwargs = {} if binary else {"encoding": "utf-8", "errors": "replace"}
+        return os.fdopen(fd, mode, **kwargs)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _record_limit_reached(records: list, filepath: str, kind: str) -> bool:
+    """Return True after recording one non-fatal partial-results limit notice."""
+    if len(records) < MAX_RECORDS_PER_FILE:
+        return False
+    print(f"  [WARN] Reached {MAX_RECORDS_PER_FILE}-record limit for {filepath}; "
+          "remaining records are ignored.", file=sys.stderr)
+    _LIMIT_NOTICES.append(f"{kind} exceeded {MAX_RECORDS_PER_FILE}-record per-file limit")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -136,13 +177,21 @@ def _is_within(path: Path, parent: Path) -> bool:
 
 
 def _is_generated_output_file(filepath: Path, input_root: Path) -> bool:
-    """True for files in this tool's default assessment-summary output folders."""
+    """True for files inside an assessment-summary* folder THIS TOOL created — one that
+    holds its analysis.json. A customer folder that merely shares the name (e.g.
+    ``assessment-summary-q3/`` with real scan files) is still read as input."""
     try:
-        relative_parts = filepath.resolve().relative_to(input_root.resolve()).parts[:-1]
-    except ValueError:
+        root = input_root.resolve()
+        relative_parts = filepath.resolve().relative_to(root).parts[:-1]
+    except (OSError, ValueError):
         return False
-    return any(part == "assessment-summary" or part.startswith("assessment-summary-")
-               for part in relative_parts)
+    current = root
+    for part in relative_parts:
+        current = current / part
+        if ((part == "assessment-summary" or part.startswith("assessment-summary-"))
+                and (current / "analysis.json").is_file()):
+            return True
+    return False
 
 
 def _should_skip_file(filepath: Path, excluded_roots: list, input_root: Path,
@@ -150,7 +199,8 @@ def _should_skip_file(filepath: Path, excluded_roots: list, input_root: Path,
                       excluded_files: list = None) -> bool:
     # These are this tool's own JSON artifacts, including when an earlier run
     # placed them outside the current deliverables directory.
-    if filepath.name in {"analysis.json", "anon_map.json"}:
+    if filepath.name in {"analysis.json", "anon_map.json"} or (
+            filepath.name.startswith("anon_map_") and filepath.name.endswith(".json")):
         return True
     if any(filepath.resolve() == excluded.resolve()
            for excluded in (excluded_files or [])):
@@ -160,29 +210,31 @@ def _should_skip_file(filepath: Path, excluded_roots: list, input_root: Path,
     return exclude_generated_outputs and _is_generated_output_file(filepath, input_root)
 
 
-def detect_scope_ids(folder_path: str, excluded_roots: list = None) -> list:
+def detect_scope_ids(folder_path: str, excluded_roots: list = None,
+                     files: dict = None) -> list:
     """Extract likely cloud scope IDs (accounts/subscriptions/projects/tenancies)
-    from filenames. Provider-neutral: matches 12-digit AWS account IDs, GUIDs
-    (Azure subscriptions), and generic project/tenancy identifiers in filenames."""
+    from filenames already accepted by the bounded input discovery. Provider-neutral:
+    matches 12-digit AWS account IDs, GUIDs (Azure subscriptions), and generic
+    project/tenancy identifiers in filenames."""
     scope_ids = set()
     # 12-digit numeric IDs (AWS accounts, some GCP project numbers)
     numeric = re.compile(r"\b(\d{12})\b")
     # GUID-style IDs (Azure subscriptions, OCI OCIDs are longer/handled separately)
     guid = re.compile(r"\b([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                       r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b")
-    input_root = Path(folder_path)
-    excluded_roots = [Path(root) for root in (excluded_roots or [])]
-    for f in input_root.rglob("*"):
-        # Skip symlinks (consistent with identify_files) so a symlinked path can't
-        # smuggle scope ids via its name from outside the input tree.
-        if f.is_symlink():
-            continue
-        if not f.is_file() or _should_skip_file(f, excluded_roots, input_root, True):
-            continue
-        for m in numeric.findall(f.name):
-            scope_ids.add(m)
-        for m in guid.findall(f.name):
-            scope_ids.add(m)
+    if files is None:
+        files = identify_files(
+            folder_path,
+            excluded_roots=excluded_roots,
+            exclude_generated_outputs=True,
+        )
+    for category_paths in files.values():
+        for filepath in category_paths:
+            filename = Path(filepath).name
+            for m in numeric.findall(filename):
+                scope_ids.add(m)
+            for m in guid.findall(filename):
+                scope_ids.add(m)
     return sorted(scope_ids)
 
 
@@ -244,81 +296,116 @@ def identify_files(folder_path: str, excluded_roots: list = None,
     except OSError:
         input_root_resolved = input_root
     _files_seen = 0
-    for f in input_root.rglob("*"):
-        # Security: skip symlinks outright, and skip anything whose real path escapes
-        # the input root (defends against symlinked files and symlinked parent dirs).
+    _paths_seen = 0
+    pending_dirs = [input_root]
+    # Stream directory entries rather than using rglob/os.walk: both construct an
+    # unbounded list for a wide directory before a limit can be applied.
+    while pending_dirs:
+        current_dir = pending_dirs.pop()
         try:
-            if f.is_symlink():
-                print(f"  [WARN] Skipping symlinked path (not followed): {f}", file=sys.stderr)
-                continue
-            f_resolved = f.resolve()
-            f_resolved.relative_to(input_root_resolved)
-        except (OSError, ValueError):
-            print(f"  [WARN] Skipping path outside input root: {f}", file=sys.stderr)
+            entries = os.scandir(current_dir)
+        except OSError as exc:
+            print(f"  [WARN] Cannot scan {current_dir}: {exc}", file=sys.stderr)
+            _LIMIT_NOTICES.append("unreadable input folder skipped")
             continue
-        # Bound recursion depth: ignore anything nested deeper than MAX_RECURSION_DEPTH
-        # directories below the input root (defends against pathological deep trees).
-        try:
-            depth = len(f.relative_to(input_root).parts)
-        except ValueError:
-            depth = MAX_RECURSION_DEPTH + 1
-        if depth > MAX_RECURSION_DEPTH:
-            print(f"  [WARN] Skipping path deeper than {MAX_RECURSION_DEPTH} levels: {f}",
-                  file=sys.stderr)
-            continue
-        if (not f.is_file()
-                or _should_skip_file(f, excluded_roots, input_root,
-                                     exclude_generated_outputs, excluded_files)):
-            continue
-        # Bound the total number of files categorized in one run.
-        _files_seen += 1
-        if _files_seen > MAX_TOTAL_FILES:
-            print(f"  [WARN] Reached file limit ({MAX_TOTAL_FILES}); ignoring additional "
-                  "input files. Narrow the input folder or split the run.", file=sys.stderr)
-            _PARSE_WARNINGS.append(f"Input exceeded {MAX_TOTAL_FILES}-file limit; truncated")
-            break
-        name_lower = f.name.lower()
+        with entries:
+            for entry in entries:
+                _paths_seen += 1
+                if _paths_seen > MAX_TOTAL_INPUT_PATHS:
+                    print(f"  [WARN] Reached input-path limit ({MAX_TOTAL_INPUT_PATHS}); "
+                          "ignoring remaining paths. Narrow the input folder or split the run.",
+                          file=sys.stderr)
+                    _LIMIT_NOTICES.append(
+                        f"input exceeded {MAX_TOTAL_INPUT_PATHS}-path limit; remaining paths ignored")
+                    return result
 
-        if name_lower.endswith(".csv"):
-            category = _classify_csv(f)
-            if category == "main":
-                result["prowler_main_csv"].append(str(f))
-            elif category == "compliance":
-                result["prowler_compliance_csv"].append(str(f))
-            else:
-                result["other"].append(str(f))
-        elif name_lower.endswith(".html") or name_lower.endswith(".htm"):
-            result["prowler_html"].append(str(f))
-        elif name_lower.endswith(".json"):
-            # A .json is a MAIN OCSF findings export only if it is the plain per-scan
-            # file (prowler-output-<id>-<ts>.ocsf.json). Prowler also emits per-FRAMEWORK
-            # OCSF/JSON compliance files (…_<framework>.ocsf.json) and places compliance
-            # outputs under a compliance/ folder — those must NOT be treated as main
-            # findings (doing so double-counts and injects an 'unknown' provider bucket).
-            if _is_compliance_json(f):
-                # Per-framework OCSF/JSON compliance exports are redundant with the
-                # semicolon-delimited compliance CSVs (which the coverage parser reads).
-                # Route them to 'other' so they are neither counted as main findings nor
-                # fed to the CSV compliance parser (which would mis-split the JSON).
-                result["other"].append(str(f))
-            else:
-                category = ("security_hub" if name_lower.endswith(".asff.json")
-                            else _classify_json(f))
-                if category == "security_hub":
-                    result["security_hub_json"].append(str(f))
+                f = Path(entry.path)
+                try:
+                    if entry.is_symlink():
+                        print(f"  [WARN] Skipping symlinked path (not followed): {f}",
+                              file=sys.stderr)
+                        _LIMIT_NOTICES.append("symlinked input path not followed")
+                        continue
+                    f_resolved = f.resolve()
+                    f_resolved.relative_to(input_root_resolved)
+                    depth = len(f.relative_to(input_root).parts)
+                except (OSError, ValueError):
+                    print(f"  [WARN] Skipping path outside input root: {f}", file=sys.stderr)
+                    _LIMIT_NOTICES.append("input path outside the input folder skipped")
+                    continue
+                if depth > MAX_RECURSION_DEPTH:
+                    print(f"  [WARN] Skipping path deeper than {MAX_RECURSION_DEPTH} levels: {f}",
+                          file=sys.stderr)
+                    _LIMIT_NOTICES.append(
+                        f"input deeper than {MAX_RECURSION_DEPTH} folder levels skipped")
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending_dirs.append(f)
+                    continue
+                # Only ordinary files are inputs. Do not open FIFOs, devices, or
+                # sockets: they can block indefinitely or have side effects.
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if _should_skip_file(f, excluded_roots, input_root,
+                                     exclude_generated_outputs, excluded_files):
+                    continue
+                _files_seen += 1
+                if _files_seen > MAX_TOTAL_FILES:
+                    print(f"  [WARN] Reached file limit ({MAX_TOTAL_FILES}); ignoring additional "
+                          "input files. Narrow the input folder or split the run.", file=sys.stderr)
+                    _LIMIT_NOTICES.append(
+                        f"input exceeded {MAX_TOTAL_FILES}-file limit; extra files ignored")
+                    return result
+                name_lower = f.name.lower()
+
+                if name_lower.endswith(".csv"):
+                    category = _classify_csv(f)
+                    if category == "main":
+                        result["prowler_main_csv"].append(str(f))
+                    elif category == "compliance":
+                        result["prowler_compliance_csv"].append(str(f))
+                    else:
+                        result["other"].append(str(f))
+                elif name_lower.endswith(".html") or name_lower.endswith(".htm"):
+                    result["prowler_html"].append(str(f))
+                elif name_lower.endswith(".json"):
+                    # A .json is a MAIN OCSF findings export only if it is the plain per-scan
+                    # file (prowler-output-<id>-<ts>.ocsf.json). Prowler also emits per-FRAMEWORK
+                    # OCSF/JSON compliance files (…_<framework>.ocsf.json) and places compliance
+                    # outputs under a compliance/ folder — those must NOT be treated as main
+                    # findings (doing so double-counts and injects an 'unknown' provider bucket).
+                    if _is_compliance_json(f):
+                        # Per-framework OCSF/JSON compliance exports are redundant with the
+                        # semicolon-delimited compliance CSVs (which the coverage parser reads).
+                        # Route them to 'other' so they are neither counted as main findings nor
+                        # fed to the CSV compliance parser (which would mis-split the JSON).
+                        result["other"].append(str(f))
+                    else:
+                        category = ("security_hub" if name_lower.endswith(".asff.json")
+                                    else _classify_json(f))
+                        if category == "security_hub":
+                            result["security_hub_json"].append(str(f))
+                        else:
+                            result["prowler_json"].append(str(f))
                 else:
-                    result["prowler_json"].append(str(f))
-        else:
-            result["other"].append(str(f))
+                    result["other"].append(str(f))
 
     return result
 
 
 def _classify_csv(filepath: Path) -> str:
     """Classify a CSV as prowler main, compliance, or other."""
+    if _file_too_large(filepath, MAX_FILE_BYTES):
+        return "other"
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-            first_line = fh.readline().strip()
+        with _open_input_file(filepath, binary=True) as fh:
+            first_line = fh.readline(MAX_CSV_HEADER_BYTES + 1)
+        if len(first_line) > MAX_CSV_HEADER_BYTES:
+            print(f"  [WARN] Skipping CSV with header exceeding {MAX_CSV_HEADER_BYTES} "
+                  f"bytes: {filepath}", file=sys.stderr)
+            _LIMIT_NOTICES.append("CSV header exceeds classification limit; input skipped")
+            return "other"
+        first_line = first_line.decode("utf-8", errors="replace").strip()
         headers = set(h.strip().upper() for h in first_line.split(";"))
         # Check compliance FIRST: compliance exports carry REQUIREMENTS_* / FRAMEWORK /
         # CHECKID (no underscore) columns that main findings files never have. Note
@@ -336,16 +423,17 @@ def _classify_csv(filepath: Path) -> str:
         if filepath.parent.name.lower() == "compliance":
             return "compliance"
     except Exception as e:
-        # Unreadable/malformed CSV header: fall back to "other" so one bad file does
-        # not abort the run, but log why for debugging instead of silently swallowing.
-        print(f"  [DEBUG] Could not classify CSV {filepath}: {e}", file=sys.stderr)
+        # An unreadable CSV may be a Prowler findings file we can't see: treat it as a
+        # parse failure (fatal) rather than silently classifying it as "other".
+        print(f"  [WARN] Could not read CSV {filepath}: {e}", file=sys.stderr)
+        _PARSE_WARNINGS.append(f"Could not read CSV {filepath}: {e}")
     return "other"
 
 
 def _classify_json(filepath: Path) -> str:
     """Classify a JSON as Security Hub / ASFF export or Prowler OCSF."""
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        with _open_input_file(filepath) as fh:
             start = fh.read(2000)
         # ASFF / Security Hub markers
         if ('"ProductArn"' in start or '"AwsSecurityFinding"' in start
@@ -392,9 +480,11 @@ def parse_prowler_main_csv(filepath: str) -> list:
     if _file_too_large(filepath, MAX_FILE_BYTES):
         return findings
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        with _open_input_file(filepath) as fh:
             reader = csv.DictReader(fh, delimiter=";")
             for row in reader:
+                if _record_limit_reached(findings, filepath, "CSV findings"):
+                    break
                 norm = {k.strip().upper(): (v.strip() if v else "")
                         for k, v in row.items() if k}
                 f = _blank_finding()
@@ -422,9 +512,11 @@ def parse_prowler_compliance_csv(filepath: str) -> list:
     if _file_too_large(filepath, MAX_FILE_BYTES):
         return records
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        with _open_input_file(filepath) as fh:
             reader = csv.DictReader(fh, delimiter=";")
             for row in reader:
+                if _record_limit_reached(records, filepath, "CSV compliance records"):
+                    break
                 normalized = {k.strip().upper(): v.strip() if v else ""
                               for k, v in row.items() if k}
                 records.append(normalized)
@@ -446,7 +538,7 @@ def parse_ocsf_json(filepath: str) -> list:
     if _file_too_large(filepath, MAX_JSON_FILE_BYTES):
         return findings
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        with _open_input_file(filepath) as fh:
             data = json.load(fh)
     except Exception as e:
         print(f"  [WARN] Failed to parse OCSF JSON {filepath}: {e}", file=sys.stderr); _PARSE_WARNINGS.append(f"Failed to parse OCSF JSON {filepath}: {e}")
@@ -456,6 +548,8 @@ def parse_ocsf_json(filepath: str) -> list:
         data = data.get("findings") or data.get("Findings") or [data]
 
     for item in data:
+        if _record_limit_reached(findings, filepath, "OCSF findings"):
+            break
         if not isinstance(item, dict):
             continue
         f = _blank_finding()
@@ -525,7 +619,7 @@ def parse_security_hub_json(filepath: str) -> list:
     if _file_too_large(filepath, MAX_JSON_FILE_BYTES):
         return findings
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+        with _open_input_file(filepath) as fh:
             data = json.load(fh)
     except Exception as e:
         print(f"  [WARN] Failed to parse Security Hub JSON {filepath}: {e}", file=sys.stderr); _PARSE_WARNINGS.append(f"Failed to parse Security Hub JSON {filepath}: {e}")
@@ -535,6 +629,8 @@ def parse_security_hub_json(filepath: str) -> list:
         data = data.get("Findings") or data.get("findings") or [data]
 
     for item in data:
+        if _record_limit_reached(findings, filepath, "Security Hub findings"):
+            break
         if not isinstance(item, dict):
             continue
         f = _blank_finding()
@@ -626,11 +722,14 @@ def parse_prowler_html(filepath: str) -> list:
     schema. Provider is inferred from column content or defaults to unknown.
     """
     findings = []
-    if _file_too_large(filepath, MAX_FILE_BYTES):
+    if _file_too_large(filepath, MAX_HTML_FILE_BYTES):
         return findings
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
-            html = fh.read()
+        with _open_input_file(filepath) as fh:
+            html = fh.read(MAX_HTML_FILE_BYTES + 1)
+        if len(html) > MAX_HTML_FILE_BYTES:
+            _LIMIT_NOTICES.append("HTML input exceeds read limit; input skipped")
+            return findings
     except Exception as e:
         print(f"  [WARN] Failed to read HTML {filepath}: {e}", file=sys.stderr); _PARSE_WARNINGS.append(f"Failed to read HTML {filepath}: {e}")
         return findings
@@ -658,6 +757,8 @@ def parse_prowler_html(filepath: str) -> list:
         return ""
 
     for row in rows[1:]:
+        if _record_limit_reached(findings, filepath, "HTML findings"):
+            break
         if len(row) < 2:
             continue
         f = _blank_finding()
@@ -992,10 +1093,51 @@ def apply_anonymization(obj, mapping: dict):
     return obj
 
 
+# Cloud scope identifiers that can appear INSIDE resource IDs even when the scope column
+# holds something else (e.g. Azure ACCOUNT_UID is the tenant, while RESOURCE_UID carries
+# /subscriptions/<guid>/...; ARNs can name other accounts).
+_EMBEDDED_ID_PATTERNS = [
+    re.compile(r"arn:aws[a-zA-Z-]*:[a-z0-9-]*:[a-z0-9-]*:(\d{12})(?=:|/)"),
+    re.compile(r"/subscriptions/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+               r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", re.IGNORECASE),
+    re.compile(r"(ocid1\.(?:tenancy|compartment)\.[a-z0-9]+\.[a-z0-9-]*\.[a-z0-9]+)"),
+]
+# GCP project IDs in resource-path form ("projects/<id>/..."), matched in any finding field.
+_GCP_PROJECT_PATTERN = re.compile(r"(?:^|[/\s\"'])projects/([a-z][a-z0-9-]{4,28}[a-z0-9])(?=/|$|\")")
+
+
+def _gcp_project_ids(text: str) -> set:
+    """GCP project IDs in resource-path form (projects/<id>/...). Real IDs almost always
+    contain a digit or hyphen; requiring one avoids masking words like 'locations'."""
+    return {m for m in _GCP_PROJECT_PATTERN.findall(text)
+            if any(c.isdigit() or c == "-" for c in m)}
+
+
+def extract_embedded_scope_ids(findings: list) -> set:
+    """Scope identifiers embedded in findings' resource IDs (and, for the specific
+    AWS/Azure/OCI patterns, anywhere in their text fields)."""
+    found = set()
+    for f in findings:
+        for value in f.values():
+            if not isinstance(value, str) or not value:
+                continue
+            for pattern in _EMBEDDED_ID_PATTERNS:
+                found.update(pattern.findall(value))
+            found.update(_gcp_project_ids(value))
+    return found
+
+
 def verify_anonymization(obj, mapping: dict) -> list:
-    """Return a list of real identifiers still present anywhere in obj (should be empty)."""
+    """Return real identifiers still present anywhere in obj (should be empty): every
+    known id, plus any provider-shaped id (ARN account, Azure subscription, OCI
+    tenancy/compartment) that was never in the mapping."""
     blob = json.dumps(obj, default=str)
-    return [real for real in mapping if real and real in blob]
+    leaks = [real for real in mapping if real and real in blob]
+    labels = set(mapping.values())
+    for pattern in _EMBEDDED_ID_PATTERNS:
+        leaks.extend(m for m in pattern.findall(blob) if m not in labels and m not in leaks)
+    leaks.extend(m for m in _gcp_project_ids(blob) if m not in labels and m not in leaks)
+    return leaks
 
 
 def peek_provider(files: dict) -> str:
@@ -1010,7 +1152,7 @@ def peek_provider(files: dict) -> str:
     # Try main CSV first (PROVIDER column).
     for csv_path in files.get("prowler_main_csv", []):
         try:
-            with open(csv_path, "r", encoding="utf-8", errors="replace") as fh:
+            with _open_input_file(csv_path) as fh:
                 header = fh.readline().strip().split(";")
                 first = fh.readline().strip().split(";")
             cols = [h.strip().upper() for h in header]
@@ -1027,7 +1169,7 @@ def peek_provider(files: dict) -> str:
     # Fall back to OCSF JSON (cloud.provider).
     for json_path in files.get("prowler_json", []):
         try:
-            with open(json_path, "r", encoding="utf-8", errors="replace") as fh:
+            with _open_input_file(json_path) as fh:
                 start = fh.read(4000)
             m = re.search(r'"provider"\s*:\s*"([^"]+)"', start)
             if m:
@@ -1043,6 +1185,32 @@ def peek_provider(files: dict) -> str:
     if files.get("security_hub_json"):
         return "aws"
     return ""
+
+
+def _refuse_symlinked_output(path: str, input_folder: str) -> None:
+    """Exit if an output folder that lives inside (or beside) the untrusted input tree is,
+    or contains, a symlink. A customer archive can ship ``assessment-summary-aws`` (or its
+    ``reports/``, ``iac/``, ``charts/``) as a symlink to redirect every deliverable write."""
+    path = os.path.abspath(path)
+    anchor = os.path.abspath(input_folder)
+    if os.path.basename(anchor).lower() == "output":
+        anchor = os.path.dirname(anchor)
+    if path != anchor and not path.startswith(anchor + os.sep):
+        return  # operator-chosen location outside the input tree
+    current = anchor
+    rel = os.path.relpath(path, anchor)
+    for part in ([] if rel == "." else rel.split(os.sep)):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            print(f"ERROR: output folder component is a symlink: {current}. "
+                  "Refusing to write deliverables through it (use --output-dir).",
+                  file=sys.stderr)
+            sys.exit(1)
+    for sub in ("reports", "iac", "charts"):
+        if os.path.islink(os.path.join(path, sub)):
+            print(f"ERROR: {os.path.join(path, sub)} is a symlink. Refusing to write "
+                  "deliverables through it (use --output-dir).", file=sys.stderr)
+            sys.exit(1)
 
 
 def resolve_default_output_dir(input_folder: str, user_output_dir: str = None,
@@ -1096,6 +1264,7 @@ def main():
                              "overwrite each other.")
     args = parser.parse_args()
     _PARSE_WARNINGS.clear()
+    _LIMIT_NOTICES.clear()
 
     input_folder = os.path.abspath(args.input_folder)
 
@@ -1106,6 +1275,10 @@ def main():
     # Peek the provider (cheap) so the default output folder can be named per provider.
     _peek_files = identify_files(input_folder, exclude_generated_outputs=True)
     _provider = peek_provider(_peek_files)
+    # The peek pass may hit limits for paths the real pass excludes; only the final
+    # discovery below decides which notices are reported.
+    _LIMIT_NOTICES.clear()
+    _PARSE_WARNINGS.clear()
 
     # Resolve the output directory (user choice, else smart per-provider default).
     output_dir = resolve_default_output_dir(input_folder, args.output_dir, _provider)
@@ -1116,6 +1289,8 @@ def main():
         output_json = os.path.join(output_dir, "analysis.json")
 
     _output_json_dir = os.path.dirname(output_json)
+    _refuse_symlinked_output(output_dir, input_folder)
+    _refuse_symlinked_output(_output_json_dir, input_folder)
     print(f"       Detected provider (for default folder): {_provider or 'unknown'}")
     print(f"       Output directory: {output_dir}")
 
@@ -1130,7 +1305,8 @@ def main():
     files = identify_files(input_folder, excluded_roots=excluded_roots,
                            exclude_generated_outputs=True,
                            excluded_files=[Path(output_json)])
-    scope_ids = detect_scope_ids(input_folder, excluded_roots=excluded_roots)
+    scope_ids = detect_scope_ids(input_folder, excluded_roots=excluded_roots,
+                                 files=files)
 
     file_count = sum(len(v) for v in files.values())
     print(f"       Found {file_count} files, {len(scope_ids)} scope id(s): {scope_ids}")
@@ -1198,8 +1374,8 @@ def main():
             if len(all_findings) > MAX_TOTAL_RECORDS:
                 print(f"  [WARN] Reached record limit ({MAX_TOTAL_RECORDS}); truncating "
                       "aggregated findings. Results are partial.", file=sys.stderr)
-                _PARSE_WARNINGS.append(
-                    f"Aggregated findings exceeded {MAX_TOTAL_RECORDS}-record limit; truncated")
+                _LIMIT_NOTICES.append(
+                    f"aggregated findings exceeded {MAX_TOTAL_RECORDS}-record limit; truncated")
                 del all_findings[MAX_TOTAL_RECORDS:]
                 break
         else:
@@ -1220,8 +1396,8 @@ def main():
         if len(all_compliance) > MAX_TOTAL_RECORDS:
             print(f"  [WARN] Reached compliance record limit ({MAX_TOTAL_RECORDS}); "
                   "truncating. Compliance coverage is partial.", file=sys.stderr)
-            _PARSE_WARNINGS.append(
-                f"Compliance records exceeded {MAX_TOTAL_RECORDS}-record limit; truncated")
+            _LIMIT_NOTICES.append(
+                f"compliance records exceeded {MAX_TOTAL_RECORDS}-record limit; truncated")
             del all_compliance[MAX_TOTAL_RECORDS:]
             break
 
@@ -1229,6 +1405,10 @@ def main():
         print(f"ERROR: {len(_PARSE_WARNINGS)} selected input file(s) could not be "
               "fully parsed; analysis was not written.", file=sys.stderr)
         sys.exit(1)
+    if _LIMIT_NOTICES:
+        print(f"  [WARN] PARTIAL RESULTS: {len(_LIMIT_NOTICES)} safety limit(s) applied "
+              f"({'; '.join(sorted(set(_LIMIT_NOTICES)))}). Recorded in "
+              "metadata.input_limits_applied.", file=sys.stderr)
 
     if _output_json_dir:
         os.makedirs(_output_json_dir, exist_ok=True)
@@ -1264,6 +1444,8 @@ def main():
             "input_folder": (input_folder if args.debug_metadata
                              else os.path.basename(os.path.normpath(input_folder))),
             "files_processed": {k: len(v) for k, v in files.items()},
+            # Path-free summary of safety limits hit (empty when results are complete).
+            "input_limits_applied": sorted(set(_LIMIT_NOTICES)),
         },
         "summary": {
             "total_checks": analysis["total_checks"],
@@ -1289,7 +1471,8 @@ def main():
     # Optional anonymization: mask every scope identifier across the ENTIRE output
     # (metadata, per-scope tables, resource ids, and ids embedded in ARNs/URIs/text).
     if args.anonymize:
-        mask = build_scope_mask(effective_scopes)
+        mask = build_scope_mask(sorted(set(effective_scopes)
+                                       | extract_embedded_scope_ids(all_findings)))
         output = apply_anonymization(output, mask)
         output["metadata"]["anonymized"] = True
         # Redact the input_folder path — it can leak operator identity or customer
@@ -1310,12 +1493,29 @@ def main():
         # key). Default to ~/.cloud-security-assessment/anon-maps/; override with
         # --anon-map-dir. Each run gets a provider+timestamp-stamped filename so a second
         # provider run does not overwrite the first run's key.
-        _anon_map_dir = (args.anon_map_dir
-                         or os.path.join(os.path.expanduser("~"),
-                                         ".cloud-security-assessment", "anon-maps"))
+        _default_anon_map_dir = os.path.join(os.path.expanduser("~"),
+                                             ".cloud-security-assessment", "anon-maps")
+        _anon_map_dir = args.anon_map_dir or _default_anon_map_dir
+        _anon_real = os.path.realpath(_anon_map_dir)
+        for _tree in (output_dir, _output_json_dir, input_folder):
+            _tree_real = os.path.realpath(_tree)
+            if _anon_real == _tree_real or _anon_real.startswith(_tree_real + os.sep):
+                print(f"ERROR: --anon-map-dir {_anon_map_dir} is inside {_tree}; the "
+                      "de-anonymization key must live outside the input and deliverables "
+                      "folders. No output was written.", file=sys.stderr)
+                sys.exit(1)
+        _anon_dir_existed = os.path.isdir(_anon_map_dir)
         try:
             os.makedirs(_anon_map_dir, mode=0o700, exist_ok=True)
-            os.chmod(_anon_map_dir, 0o700)  # tighten if it pre-existed with looser perms
+            # Only tighten permissions on a directory this tool owns: one it just created,
+            # or its own default location. Never chmod an existing operator-supplied
+            # directory (it may be shared) — the 0o600 key file below is protected anyway.
+            if not _anon_dir_existed or os.path.abspath(_anon_map_dir) == _default_anon_map_dir:
+                os.chmod(_anon_map_dir, 0o700)
+            elif os.stat(_anon_map_dir).st_mode & 0o077:
+                print(f"  [WARN] --anon-map-dir {_anon_map_dir} is accessible to other "
+                      "users; permissions left unchanged. The key file itself is "
+                      "owner-only (0600), but consider a private directory.", file=sys.stderr)
         except OSError as e:
             print(f"ERROR: cannot create operator anon-map directory {_anon_map_dir}: {e}",
                   file=sys.stderr)

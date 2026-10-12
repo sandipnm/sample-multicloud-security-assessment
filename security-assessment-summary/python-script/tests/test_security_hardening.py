@@ -11,13 +11,16 @@ injection in generated deliverables.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+PPTX_SCRIPT = SCRIPTS_DIR / "generate_pptx.js"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import analyze_security_data as analyzer
@@ -123,6 +126,28 @@ class ResourceLimitTests(unittest.TestCase):
         # The limit must be a bounded value, not sys.maxsize (DoS guard).
         self.assertLessEqual(csv.field_size_limit(), analyzer.MAX_FIELD_BYTES)
         self.assertLess(analyzer.MAX_FIELD_BYTES, sys.maxsize)
+
+    def test_csv_classification_checks_size_before_reading_header(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "big.csv"
+            path.write_text(MAIN_CSV, encoding="utf-8")
+            original = analyzer.MAX_FILE_BYTES
+            try:
+                analyzer.MAX_FILE_BYTES = 1
+                self.assertEqual(analyzer._classify_csv(path), "other")
+            finally:
+                analyzer.MAX_FILE_BYTES = original
+
+    def test_csv_classification_bounds_header_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "long-header.csv"
+            path.write_bytes(b"STATUS;SEVERITY;" + b"x" * 64)
+            original = analyzer.MAX_CSV_HEADER_BYTES
+            try:
+                analyzer.MAX_CSV_HEADER_BYTES = 16
+                self.assertEqual(analyzer._classify_csv(path), "other")
+            finally:
+                analyzer.MAX_CSV_HEADER_BYTES = original
 
 
 class SidecarNoFollowTests(unittest.TestCase):
@@ -260,6 +285,57 @@ class AggregateLimitTests(unittest.TestCase):
             finally:
                 analyzer.MAX_RECURSION_DEPTH = original
 
+    def test_scope_id_detection_uses_discovery_limits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir) / "scan"
+            deep = input_dir / "a" / "b" / "c" / "d"
+            deep.mkdir(parents=True)
+            (input_dir / "111122223333.csv").write_text(MAIN_CSV, encoding="utf-8")
+            (deep / "999988887777.csv").write_text(MAIN_CSV, encoding="utf-8")
+            original = analyzer.MAX_RECURSION_DEPTH
+            try:
+                analyzer.MAX_RECURSION_DEPTH = 2
+                scope_ids = analyzer.detect_scope_ids(str(input_dir))
+                self.assertIn("111122223333", scope_ids)
+                self.assertNotIn("999988887777", scope_ids)
+            finally:
+                analyzer.MAX_RECURSION_DEPTH = original
+
+    def test_discovery_prunes_over_depth_directories_before_descending(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir) / "scan"
+            deep = input_dir / "a" / "b" / "c" / "d"
+            deep.mkdir(parents=True)
+            (deep / "deep.csv").write_text(MAIN_CSV, encoding="utf-8")
+            original_depth = analyzer.MAX_RECURSION_DEPTH
+            real_scandir = analyzer.os.scandir
+            scanned_dirs = []
+
+            def tracking_scandir(path):
+                scanned_dirs.append(Path(path))
+                return real_scandir(path)
+
+            try:
+                analyzer.MAX_RECURSION_DEPTH = 2
+                with mock.patch.object(analyzer.os, "scandir", side_effect=tracking_scandir):
+                    analyzer.identify_files(str(input_dir))
+            finally:
+                analyzer.MAX_RECURSION_DEPTH = original_depth
+
+            self.assertNotIn(input_dir / "a" / "b" / "c", scanned_dirs)
+
+    def test_discovery_skips_fifo_without_opening_it(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFOs are not supported on this platform")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir) / "scan"
+            input_dir.mkdir()
+            fifo = input_dir / "stalled.csv"
+            os.mkfifo(fifo)
+            files = analyzer.identify_files(str(input_dir))
+            self.assertNotIn(str(fifo), files["prowler_main_csv"])
+            self.assertNotIn(str(fifo), files["other"])
+
     def test_aggregate_limits_are_bounded(self):
         self.assertLess(analyzer.MAX_TOTAL_FILES, 10 ** 9)
         self.assertLess(analyzer.MAX_RECURSION_DEPTH, 10 ** 6)
@@ -320,6 +396,127 @@ class ParentSymlinkContainmentTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "ok")
 
 
+class PptxOutputSymlinkTests(unittest.TestCase):
+    @staticmethod
+    def _analysis():
+        return {
+            "metadata": {"customer": "Acme", "scan_date": "2026-10-09",
+                         "providers": ["aws"]},
+            "summary": {
+                "security_score": 50,
+                "total_checks": 0,
+                "findings_by_severity": {
+                    "critical": 0, "high": 0, "medium": 0, "low": 0, "other": 0,
+                },
+                "findings_by_service": {},
+            },
+            "top_failed_checks": [],
+            "compliance_coverage": {},
+        }
+
+    def _run_pptx(self, analysis, charts, output):
+        return subprocess.run(
+            ["node", str(PPTX_SCRIPT), str(analysis), str(charts), str(output)],
+            capture_output=True, text=True,
+        )
+
+    def test_pptx_write_refuses_final_symlink(self):
+        if not shutil.which("node") or not (SCRIPTS_DIR / "node_modules" / "pptxgenjs").exists():
+            self.skipTest("Node.js and pptxgenjs are required")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            analysis = root / "analysis.json"
+            analysis.write_text(json.dumps(self._analysis()), encoding="utf-8")
+            victim = root / "victim.pptx"
+            victim.write_bytes(b"UNTOUCHED")
+            output = root / "deck.pptx"
+            try:
+                output.symlink_to(victim)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported on this platform")
+
+            result = self._run_pptx(analysis, root, output)
+
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(victim.read_bytes(), b"UNTOUCHED")
+
+    def test_pptx_write_refuses_symlinked_reports_directory(self):
+        if not shutil.which("node") or not (SCRIPTS_DIR / "node_modules" / "pptxgenjs").exists():
+            self.skipTest("Node.js and pptxgenjs are required")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            analysis = root / "analysis.json"
+            analysis.write_text(json.dumps(self._analysis()), encoding="utf-8")
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            reports = root / "reports"
+            try:
+                reports.symlink_to(elsewhere, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported on this platform")
+
+            result = self._run_pptx(analysis, root, reports / "deck.pptx")
+
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((elsewhere / "deck.pptx").exists())
+
+    def test_pptx_write_refuses_nested_reports_symlink(self):
+        if not shutil.which("node") or not (SCRIPTS_DIR / "node_modules" / "pptxgenjs").exists():
+            self.skipTest("Node.js and pptxgenjs are required")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            analysis = root / "analysis.json"
+            analysis.write_text(json.dumps(self._analysis()), encoding="utf-8")
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            reports = root / "deliverables" / "reports"
+            reports.parent.mkdir()
+            try:
+                reports.symlink_to(elsewhere, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported on this platform")
+
+            result = self._run_pptx(analysis, root, reports / "nested" / "deck.pptx")
+
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((elsewhere / "nested" / "deck.pptx").exists())
+
+    def test_pptx_write_refuses_symlinked_deliverables_root(self):
+        if not shutil.which("node") or not (SCRIPTS_DIR / "node_modules" / "pptxgenjs").exists():
+            self.skipTest("Node.js and pptxgenjs are required")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            analysis = root / "analysis.json"
+            analysis.write_text(json.dumps(self._analysis()), encoding="utf-8")
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            deliverables = root / "deliverables"
+            try:
+                deliverables.symlink_to(elsewhere, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks not supported on this platform")
+
+            result = self._run_pptx(analysis, root,
+                                    deliverables / "reports" / "deck.pptx")
+
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((elsewhere / "reports" / "deck.pptx").exists())
+
+    def test_pptx_write_preserves_normal_output_and_suffix_behavior(self):
+        if not shutil.which("node") or not (SCRIPTS_DIR / "node_modules" / "pptxgenjs").exists():
+            self.skipTest("Node.js and pptxgenjs are required")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            analysis = root / "analysis.json"
+            analysis.write_text(json.dumps(self._analysis()), encoding="utf-8")
+            output = root / "deck"
+
+            result = self._run_pptx(analysis, root, output)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "deck.pptx").exists())
+
+
 class SidecarPermissionTests(unittest.TestCase):
     def test_operator_keydir_and_key_are_owner_only(self):
         if os.name != "posix":
@@ -331,15 +528,36 @@ class SidecarPermissionTests(unittest.TestCase):
             (input_dir / "main.csv").write_text(MAIN_CSV, encoding="utf-8")
             output = root / "aws" / "deliverables" / "analysis.json"
             keydir = root / "operator_keys"
-            # Pre-create the keydir world-readable; the tool must tighten it to 0o700.
-            keydir.mkdir()
-            os.chmod(keydir, 0o755)
-
+            # A keydir the tool creates itself is owner-only.
             result = run_analyzer(input_dir, output, "--anonymize",
                                   "--anon-map-dir", str(keydir))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(oct(keydir.stat().st_mode & 0o777), oct(0o700))
             keys = list(keydir.glob("anon_map_*.json"))
+            self.assertEqual(len(keys), 1)
+            self.assertEqual(oct(keys[0].stat().st_mode & 0o777), oct(0o600))
+
+    def test_existing_operator_keydir_permissions_are_not_changed(self):
+        if os.name != "posix":
+            self.skipTest("POSIX permission bits only")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "aws" / "output"
+            input_dir.mkdir(parents=True)
+            (input_dir / "main.csv").write_text(MAIN_CSV, encoding="utf-8")
+            output = root / "aws" / "deliverables" / "analysis.json"
+            # A pre-existing (possibly shared) directory must be left as-is, with a warning;
+            # only the key file itself is forced to 0o600.
+            shared = root / "shared_keys"
+            shared.mkdir()
+            os.chmod(shared, 0o755)
+
+            result = run_analyzer(input_dir, output, "--anonymize",
+                                  "--anon-map-dir", str(shared))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(oct(shared.stat().st_mode & 0o777), oct(0o755))
+            self.assertIn("permissions left unchanged", result.stderr)
+            keys = list(shared.glob("anon_map_*.json"))
             self.assertEqual(len(keys), 1)
             self.assertEqual(oct(keys[0].stat().st_mode & 0o777), oct(0o600))
 
@@ -414,6 +632,97 @@ class PdfTruncationTests(unittest.TestCase):
         out = generate_pdf._safe("A" * 100, max_len=10)
         self.assertTrue(out.endswith("…"))
         self.assertLessEqual(len(out), 10)
+
+
+class ReviewFixAnalyzerAndOutputTests(unittest.TestCase):
+    """Regressions for the 2026-10-09 review (limits, containment, README, dashboard)."""
+
+    def test_oversized_file_is_partial_not_fatal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "scan"
+            input_dir.mkdir()
+            (input_dir / "main.csv").write_text(MAIN_CSV, encoding="utf-8")
+            (input_dir / "huge.csv").write_text(MAIN_CSV + "PASS;Low;x;S3;1;aws\n" * 50,
+                                                encoding="utf-8")
+            output = root / "analysis.json"
+            # Run in-process so the size cap can be lowered for the test.
+            original = analyzer.MAX_FILE_BYTES
+            analyzer.MAX_FILE_BYTES = len(MAIN_CSV) + 10
+            argv = sys.argv
+            sys.argv = ["analyze_security_data.py", str(input_dir), str(output)]
+            try:
+                analyzer.main()
+            finally:
+                analyzer.MAX_FILE_BYTES = original
+                sys.argv = argv
+            data = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(data["metadata"]["input_limits_applied"],
+                             ["oversized input file skipped"])
+
+    def test_file_count_limit_is_partial_not_fatal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "scan"
+            input_dir.mkdir()
+            (input_dir / "main.csv").write_text(MAIN_CSV, encoding="utf-8")
+            for i in range(4):
+                (input_dir / f"more{i}.csv").write_text(MAIN_CSV, encoding="utf-8")
+            output = root / "analysis.json"
+            original = analyzer.MAX_TOTAL_FILES
+            analyzer.MAX_TOTAL_FILES = 2
+            argv = sys.argv
+            sys.argv = ["analyze_security_data.py", str(input_dir), str(output)]
+            try:
+                analyzer.main()
+            finally:
+                analyzer.MAX_TOTAL_FILES = original
+                sys.argv = argv
+            self.assertTrue(output.exists())
+            limits = json.loads(output.read_text(encoding="utf-8"))["metadata"]["input_limits_applied"]
+            self.assertEqual(len(limits), 1)
+            self.assertIn("file limit", limits[0])
+
+    def test_symlinked_reports_subfolder_is_contained(self):
+        if os.name != "posix":
+            self.skipTest("symlinks")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            out = root / "deliverables"
+            out.mkdir()
+            elsewhere = root / "elsewhere"
+            elsewhere.mkdir()
+            (out / "reports").symlink_to(elsewhere, target_is_directory=True)
+            data = {"metadata": {}, "summary": {"total_checks": 0, "pass_count": 0,
+                    "fail_count": 0, "findings_by_severity": {}, "findings_by_service": {}}}
+            analysis = out / "analysis.json"
+            analysis.write_text(json.dumps(data), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "generate_dashboard.py"), str(analysis),
+                 str(out / "reports" / "dash.html")], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_containment_root_only_for_paths_inside_anchor(self):
+        import safe_io
+        self.assertEqual(safe_io.containment_root("/a/out/reports/x.html", "/a/out"), "/a/out")
+        self.assertIsNone(safe_io.containment_root("/b/x.html", "/a/out"))
+
+    def test_readme_file_names_are_plain_slugs(self):
+        data = {
+            "metadata": {"customer": "AT&T_Corp", "providers": ["aws"], "scan_date": "2026-10-09"},
+            "summary": {"total_checks": 1, "security_score": 50,
+                        "findings_by_severity": {"critical": 0, "high": 1, "medium": 0, "low": 0},
+                        "findings_by_service": {}},
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out = Path(temp_dir) / "AT_T_Corp_README.md"
+            generate_readme.generate_readme(data, str(out))
+            text = out.read_text(encoding="utf-8")
+            self.assertIn("`reports/AT_T_Corp_Security_Dashboard.html`", text)
+            self.assertIn("`AT_T_Corp_README.md`", text)
+            self.assertNotIn("\\_", text.split("### Deliverables")[1].split("##")[0])
+            self.assertIn("AT&amp;T\\_Corp", text)  # display name still escaped
 
 
 if __name__ == "__main__":

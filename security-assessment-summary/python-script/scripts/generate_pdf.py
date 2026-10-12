@@ -14,9 +14,12 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 from html import escape
 from providers import PROVIDER_LABELS as PROVIDER_LABEL, PROVIDER_SCOPE_TERM as SCOPE_TERM
+import safe_io
 
 try:
     from reportlab.lib import colors
@@ -123,17 +126,14 @@ def build_pdf(data: dict, output_path: str, charts_dir: str = ""):
     top_checks = data["top_failed_checks"]
     compliance = data.get("compliance_coverage", {})
 
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    # reportlab opens output_path itself, so we can't hand it a no-follow descriptor.
-    # Refuse up front if the target already exists as a symlink, so a pre-planted
-    # symlink can't redirect the PDF write outside the intended location.
-    if os.path.islink(output_path):
-        print(f"ERROR: refusing to write PDF to a symlink: {output_path}", file=sys.stderr)
-        sys.exit(1)
+    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    if os.path.lexists(output_dir) and os.path.islink(output_dir):
+        raise OSError(f"refusing to write PDF to a symlinked directory: {output_dir}")
+    os.makedirs(output_dir, mode=0o700, exist_ok=True)
+    temp_fd, temp_path = tempfile.mkstemp(prefix=".remediation-", suffix=".pdf", dir=output_dir)
+    os.close(temp_fd)
     doc = SimpleDocTemplate(
-        output_path, pagesize=letter,
+        temp_path, pagesize=letter,
         leftMargin=0.75 * inch, rightMargin=0.75 * inch,
         topMargin=0.9 * inch, bottomMargin=0.75 * inch,
     )
@@ -153,6 +153,13 @@ def build_pdf(data: dict, output_path: str, charts_dir: str = ""):
     E.append(Spacer(1, 2 * inch))
     E.append(Paragraph("Cloud Security", styles["CenterTitle"]))
     E.append(Paragraph("Remediation Plan", styles["CenterTitle"]))
+    _limits = meta.get("input_limits_applied") or []
+    if _limits:
+        E.append(Spacer(1, 0.2 * inch))
+        E.append(Paragraph(
+            "<b>⚠️ PARTIAL RESULTS:</b> safety limits were applied while reading the scan input "
+            "(" + "; ".join(_safe(x, max_len=200) for x in _limits) + "). Some findings may be "
+            "missing and the score is computed on partial data.", styles["BodyWrap"]))
     E.append(Spacer(1, 0.5 * inch))
     E.append(Paragraph(_safe(customer), styles["Subtitle"]))
     E.append(Paragraph(f"Assessment Date: {_safe(scan_date)}", styles["BodyWrap"]))
@@ -375,7 +382,14 @@ def build_pdf(data: dict, output_path: str, charts_dir: str = ""):
         "logging, encryption). Review each module and run <b>terraform plan</b> before <b>apply</b>.",
         styles["BodyWrap"]))
 
-    doc.build(E, onFirstPage=header_footer, onLaterPages=header_footer)
+    try:
+        doc.build(E, onFirstPage=header_footer, onLaterPages=header_footer)
+        with open(temp_path, "rb") as source:
+            with safe_io.open_write_nofollow(output_path, binary=True, root=output_dir) as dest:
+                shutil.copyfileobj(source, dest)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
     print(f"✅ PDF remediation plan generated → {output_path}")
 
 

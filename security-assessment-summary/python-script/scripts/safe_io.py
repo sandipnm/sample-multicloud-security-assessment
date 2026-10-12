@@ -11,7 +11,13 @@ HTML, README, PDF, Terraform) into an output directory. These helpers:
   * use O_NOFOLLOW so a symlink planted at the FINAL output path makes the open
     fail instead of redirecting the write (symlink-redirect defense), and
   * when a ``root`` is supplied, refuse to write when the resolved parent directory
-    is not under the resolved root (catches ``..`` traversal and gross escapes).
+    is not under the resolved root (catches ``..`` traversal and a symlinked
+    SUBFOLDER such as ``reports/`` that points outside the output folder).
+
+``root`` only protects anything if it is a real ANCESTOR of the output file — the
+output folder the caller means to contain the write. Passing the file's own parent
+makes the check a no-op for symlinked subfolders; use :func:`containment_root` to
+derive a meaningful root.
 
 Scope note: benign symlinks higher in the path (e.g. macOS ``/tmp`` ->
 ``/private/tmp``) are tolerated because both sides are resolved before comparison.
@@ -21,6 +27,7 @@ equivalent to being able to write the files directly.
 """
 
 import os
+import stat
 
 
 class UnsafeOutputPathError(OSError):
@@ -41,39 +48,86 @@ def assert_within_root(path: str, root: str) -> None:
             f"refusing to write outside output root: {path_real} not under {root_real}")
 
 
+def containment_root(output_path: str, anchor_dir: str):
+    """Return ``anchor_dir`` if ``output_path`` is LEXICALLY inside it, else None.
+
+    Used by writers whose layout implies an output folder (e.g. the folder holding
+    analysis.json, with the dashboard under ``reports/``). If the operator deliberately
+    writes elsewhere, there is no implied root and containment is not enforced.
+    """
+    anchor = os.path.abspath(anchor_dir or ".")
+    target = os.path.abspath(output_path)
+    if target == anchor or target.startswith(anchor + os.sep):
+        return anchor
+    return None
+
+
 def open_write_nofollow(path: str, binary: bool = False, root: str = None):
     """Open ``path`` for writing, refusing to follow a symlink at the final component
     AND refusing a parent directory that resolves outside ``root`` (when given).
 
     O_NOFOLLOW protects the final path component: a symlink planted at ``path`` makes
-    the open fail instead of redirecting the write. Passing ``root`` additionally
-    defends against a symlinked PARENT directory — the resolved parent must stay under
-    the resolved output root, so a swapped-in parent symlink can't redirect the write
-    (or a later Terraform cleanup) outside the intended tree.
+    the open fail instead of redirecting the write. Passing ``root`` (an ancestor
+    folder of ``path``) additionally requires the resolved parent to stay under the
+    resolved root, so a symlinked subfolder between ``root`` and the file can't
+    redirect the write outside the intended tree. If ``root`` is the file's own parent,
+    only ``..`` escapes are caught.
 
-    Parent directories are created if missing.
+    Parent directories are created if missing — but when ``root`` is given, every
+    existing component between ``root`` and the file is checked (no symlinks) BEFORE
+    anything is created, so a planted symlinked subfolder can't make us create
+    directories outside the root.
+
+    The file is opened WITHOUT O_TRUNC and only truncated after ``fstat`` confirms it
+    is a regular file with a single link owned by this user, so a planted HARD link
+    can't make us truncate another file (O_NOFOLLOW does not cover hard links).
     """
-    parent = os.path.dirname(path) or "."
-    os.makedirs(parent, exist_ok=True)
+    parent = os.path.abspath(os.path.dirname(path) or ".")
     if root is not None:
-        # Defend against a symlink redirecting the write outside the intended tree. We
-        # compare the FULLY RESOLVED parent against the FULLY RESOLVED root: both sides
-        # canonicalize benign symlinks (e.g. macOS /tmp -> /private/tmp), so a legitimate
-        # output dir is accepted, while a parent that resolves somewhere NOT under the
-        # resolved root (an attacker-swapped symlink pointing elsewhere) is rejected.
+        root_abs = os.path.abspath(root)
+        if parent != root_abs and not parent.startswith(root_abs + os.sep):
+            raise UnsafeOutputPathError(
+                f"refusing to write outside output root: parent {parent} not under {root_abs}")
+        if not os.path.lexists(root_abs):
+            os.makedirs(root_abs)  # the root itself is operator-chosen; create it if missing
+        current = root_abs
+        rel = os.path.relpath(parent, root_abs)
+        for part in ([] if rel == "." else rel.split(os.sep)):
+            current = os.path.join(current, part)
+            if os.path.lexists(current):
+                if os.path.islink(current) or not os.path.isdir(current):
+                    raise UnsafeOutputPathError(
+                        f"refusing to write via symlinked/non-directory component: {current}")
+            else:
+                os.mkdir(current)
+        # Defense in depth: the fully resolved parent must stay under the resolved root
+        # (both sides canonicalize benign symlinks such as macOS /tmp -> /private/tmp).
         parent_real = os.path.realpath(parent)
-        root_real = os.path.realpath(root)
+        root_real = os.path.realpath(root_abs)
         if parent_real != root_real and not parent_real.startswith(root_real + os.sep):
             raise UnsafeOutputPathError(
                 f"refusing to write outside output root: parent {parent_real} "
                 f"not under {root_real}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    else:
+        os.makedirs(parent, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags, 0o644)
+        fd = os.open(path, flags, 0o600)
     except OSError as e:
         raise UnsafeOutputPathError(
             f"refusing to write output at {path}: {e} "
             "(a symlink or unwritable path may be present)") from e
+    try:
+        st = os.fstat(fd)
+        euid = os.geteuid() if hasattr(os, "geteuid") else st.st_uid
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != euid:
+            raise UnsafeOutputPathError(
+                f"refusing to write output at {path}: not a single-link regular file "
+                "owned by this user (possible hard-link redirect)")
+        os.ftruncate(fd, 0)
+    except BaseException:
+        os.close(fd)
+        raise
     mode = "wb" if binary else "w"
     kwargs = {} if binary else {"encoding": "utf-8"}
     return os.fdopen(fd, mode, **kwargs)

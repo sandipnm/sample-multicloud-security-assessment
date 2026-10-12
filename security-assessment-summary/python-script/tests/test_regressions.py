@@ -125,11 +125,19 @@ class DashboardRegressionTests(unittest.TestCase):
             self.assertIn("scope&quot;&gt;&lt;img", rendered)
             self.assertIn('style="width: 50%; background-color:', rendered)
 
+            # A malformed or out-of-range rate skips only that card; the dashboard still
+            # renders, and the bad value never reaches the style attribute.
             data["compliance_coverage"]["CIS"]["pass_rate"] = "50%; color: red"
+            data["compliance_coverage"]["NIST"] = {"total": 4, "pass": 1, "pass_rate": 250}
+            data["compliance_coverage"]["ISO"] = {"total": 4, "pass": 3, "pass_rate": 75}
             invalid_output = Path(temp_dir) / "invalid.html"
-            with self.assertRaisesRegex(ValueError, "Compliance pass rate must be numeric"):
-                dashboard.generate_html(data, str(invalid_output))
-            self.assertFalse(invalid_output.exists())
+            dashboard.generate_html(data, str(invalid_output))
+            rendered = invalid_output.read_text(encoding="utf-8")
+            self.assertNotIn("color: red", rendered)
+            self.assertNotIn("<h6>CIS</h6>", rendered)
+            self.assertNotIn("<h6>NIST</h6>", rendered)
+            self.assertIn("<h6>ISO</h6>", rendered)
+            self.assertIn('style="width: 75%; background-color:', rendered)
 
     def test_compliance_card_shows_check_and_requirement_denominators(self):
         coverage = analyzer.analyze_compliance([

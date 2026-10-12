@@ -15,14 +15,15 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "generate_iac.py"
 
 
-def run_generator(directory, provider, selections, customer="Example Customer", output=None):
+def run_generator(directory, provider, selections, customer="Example Customer", output=None,
+                  extra=()):
     root = Path(directory)
     analysis = root / "analysis.json"
     analysis.write_text(json.dumps({"metadata": {"customer": customer}}), encoding="utf-8")
     destination = output or root / "iac"
     result = subprocess.run(
         [sys.executable, str(SCRIPT), str(analysis), selections, str(destination),
-         "--provider", provider],
+         "--provider", provider, *extra],
         capture_output=True, text=True,
     )
     return result, destination
@@ -73,12 +74,12 @@ class IaCGeneratorTests(unittest.TestCase):
             variables = (output / "variables.tf").read_text(encoding="utf-8")
             self.assertEqual(
                 set(re.findall(r'variable "([^"]+)"', variables)),
-                {"environment", "project_id", "region", "bucket_name"},
+                {"environment", "project_id", "region", "bucket_name", "gcs_access_log_bucket"},
             )
             tfvars = (output / "terraform.tfvars.example").read_text(encoding="utf-8")
             self.assertEqual(
                 set(re.findall(r"^([a-z_]+)\s*=", tfvars, re.MULTILINE)),
-                {"environment", "project_id", "region", "bucket_name"},
+                {"environment", "project_id", "region", "bucket_name", "gcs_access_log_bucket"},
             )
 
     def test_unknown_selection_fails_without_touching_prior_output(self):
@@ -111,8 +112,13 @@ class IaCGeneratorTests(unittest.TestCase):
             handwritten = output / "operator_extra.tf"
             handwritten.write_text("# operator's own module", encoding="utf-8")
 
+            # Without acknowledgement, an unknown Terraform file is refused (it could be
+            # planted); the operator explicitly keeps their own with the flag.
+            refused, _ = run_generator(directory, "aws", "security_groups", output=output)
+            self.assertNotEqual(refused.returncode, 0)
             # Re-run with a reduced selection; audit_logging should be cleaned up.
-            result2, _ = run_generator(directory, "aws", "security_groups", output=output)
+            result2, _ = run_generator(directory, "aws", "security_groups", output=output,
+                                       extra=("--keep-existing-terraform",))
             self.assertEqual(result2.returncode, 0, result2.stderr)
             self.assertTrue(handwritten.exists(), "hand-written file must be preserved")
             self.assertFalse((output / "Example_Customer_aws_audit_logging.tf").exists(),
@@ -175,7 +181,8 @@ class IaCGeneratorTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             s3 = next(output.glob("*s3_public_access.tf")).read_text(encoding="utf-8")
             self.assertIn("DenyInsecureTransport", s3)
-            self.assertIn('"aws:SecureTransport" = "false"', s3)
+            self.assertIn('variable = "aws:SecureTransport"', s3)
+            self.assertIn('values   = ["false"]', s3)
 
     def test_cloudtrail_bucket_is_hardened(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -187,6 +194,94 @@ class IaCGeneratorTests(unittest.TestCase):
             self.assertIn("DenyInsecureTransport", ct)
             self.assertIn("AWSCloudTrailWrite", ct)
             self.assertIn("aws_s3_bucket_public_access_block", ct)
+
+
+class ReviewFixIaCTests(unittest.TestCase):
+    """Regressions for the 2026-10-09 review: generated Terraform must not break an
+    existing customer environment when applied."""
+
+    def _read(self, output, pattern):
+        return next(output.glob(pattern)).read_text(encoding="utf-8")
+
+    def test_s3_tls_policy_merges_existing_policy_and_is_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, output = run_generator(directory, "aws", "s3_public_access")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            s3 = self._read(output, "*s3_public_access.tf")
+            self.assertIn("source_policy_documents", s3)
+            self.assertIn("var.existing_bucket_policy_json", s3)
+            self.assertIn("count  = var.enforce_tls_bucket_policy ? 1 : 0", s3)
+            variables = (output / "variables.tf").read_text(encoding="utf-8")
+            block = re.search(r'variable "enforce_tls_bucket_policy" \{[^}]*\}', variables).group(0)
+            self.assertNotIn("default", block)  # explicit decision, no default
+            tfvars = (output / "terraform.tfvars.example").read_text(encoding="utf-8")
+            self.assertIn("REPLACES the bucket policy", tfvars)
+
+    def test_egress_is_required_decision_with_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, output = run_generator(directory, "aws", "security_groups")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            sg = self._read(output, "*security_groups.tf")
+            self.assertIn("cidr_blocks = var.allowed_egress_cidrs", sg)
+            self.assertNotIn("10.0.0.0/8", sg)
+            variables = (output / "variables.tf").read_text(encoding="utf-8")
+            block = re.search(r'variable "allowed_egress_cidrs" \{[^}]*\}', variables).group(0)
+            self.assertNotIn("default", block)
+            tfvars = (output / "terraform.tfvars.example").read_text(encoding="utf-8")
+            line = next(l for l in tfvars.splitlines() if l.startswith("allowed_egress_cidrs"))
+            self.assertIn("REQUIRED", line)
+            self.assertIn("AWS public endpoints", line)
+
+    def test_cloudtrail_bucket_create_or_existing_and_source_conditions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, output = run_generator(directory, "aws", "audit_logging")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            trail = self._read(output, "*audit_logging.tf")
+            # Every bucket-managing resource is conditional on create_log_bucket.
+            for res in ("aws_s3_bucket", "aws_s3_bucket_versioning",
+                        "aws_s3_bucket_object_lock_configuration",
+                        "aws_s3_bucket_policy"):
+                body = re.search(rf'resource "{res}" "trail_logs" \{{(.*?)\n\}}', trail, re.S).group(1)
+                self.assertIn("count", body, res)
+            self.assertIn("s3_bucket_name                = var.log_bucket_name", trail)
+            self.assertEqual(trail.count('"aws:SourceArn"     = local.cloudtrail_arn'), 2)
+            self.assertEqual(trail.count('"aws:SourceAccount"'), 2)
+            self.assertIn("/AWSLogs/${data.aws_caller_identity.trail.account_id}/*", trail)
+            variables = (output / "variables.tf").read_text(encoding="utf-8")
+            self.assertIn("must not exist", variables.replace("NOT", "not"))
+
+    def test_rerun_over_pre_manifest_output_replaces_legacy_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "iac"
+            out.mkdir()
+            # Simulate an older generator version: generated headers, no manifest.
+            (out / "providers.tf").write_text(
+                "# \u26a0\ufe0f  AUTO-GENERATED \u2014 REVIEW BEFORE DEPLOY\nold\n", encoding="utf-8")
+            (out / "variables.tf").write_text(
+                "# Shared variable declarations for all remediation modules in this directory.\n",
+                encoding="utf-8")
+            stale = out / "Example_Customer_aws_iam_mfa.tf"
+            stale.write_text("# Example Customer \u2014 IAM\n# x\n"
+                             "# Variables are declared in variables.tf; providers/locals are shared.\n",
+                             encoding="utf-8")
+            hand = out / "my_network.tf"
+            hand.write_text("# operator-owned\n", encoding="utf-8")
+            result, _ = run_generator(directory, "aws", "kms_rotation", output=out,
+                                      extra=("--keep-existing-terraform",))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(stale.exists(), "stale legacy module must be cleaned up")
+            self.assertIn("AUTO-GENERATED", (out / "providers.tf").read_text(encoding="utf-8"))
+            self.assertTrue(hand.exists(), "unrelated hand-written file must be kept")
+            self.assertTrue((out / ".cloud-sec-assessment-manifest.json").exists())
+
+    def test_hand_written_shared_file_still_refused_without_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "iac"
+            out.mkdir()
+            (out / "providers.tf").write_text("# mine\n", encoding="utf-8")
+            result, _ = run_generator(directory, "aws", "kms_rotation", output=out)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((out / "providers.tf").read_text(encoding="utf-8"), "# mine\n")
 
 
 if __name__ == "__main__":

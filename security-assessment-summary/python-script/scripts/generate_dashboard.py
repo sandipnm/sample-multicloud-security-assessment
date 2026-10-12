@@ -331,7 +331,26 @@ def _build_roadmap(top_checks: list) -> dict:
     }
 
 
-def generate_html(data: dict, output_path: str):
+def _html_partial_banner(limits: list, truncated, total) -> str:
+    """Visible warning when the analysis hit safety limits (results are partial) or the
+    detailed findings list was capped. Empty string when results are complete."""
+    if not limits and not truncated:
+        return ""
+    rows = ""
+    if limits:
+        items = "".join(f"<li>{_esc(item)}</li>" for item in limits)
+        rows += ('<div><strong>&#9888; Partial results.</strong> Safety limits were applied '
+                 'while reading the scan input, so some findings may be missing and the score '
+                 f'is computed on partial data:<ul class="mb-0">{items}</ul></div>')
+    if truncated:
+        rows += ('<div class="mt-1">The detailed findings table is truncated'
+                 f'{" (" + _esc(total) + " findings in total)" if total else ""}; '
+                 'summary counts include every finding.</div>')
+    return (f'<div class="alert alert-warning mb-4" role="alert" id="partial-results">'
+            f'{rows}</div>')
+
+
+def generate_html(data: dict, output_path: str, output_root: str = None):
     """Main generation function."""
     meta = data.get("metadata", {})
     customer = _esc(meta.get("customer", "Security Assessment"))
@@ -397,6 +416,9 @@ def generate_html(data: dict, output_path: str):
     parts.append(_html_sidebar())
     parts.append(_html_main_start())
     parts.append(_html_overview(customer, scan_date, num_accounts, security_score, provider_str, scope_term))
+    parts.append(_html_partial_banner(meta.get("input_limits_applied") or [],
+                                      data.get("detailed_findings_truncated"),
+                                      data.get("detailed_findings_total")))
     parts.append(_html_global_filter())
     parts.append(_html_kpi_cards(critical, high, total_checks, num_accounts, scope_label))
     parts.append(_html_charts_section())
@@ -430,7 +452,10 @@ def generate_html(data: dict, output_path: str):
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    with safe_io.open_write_nofollow(output_path, root=(output_dir or ".")) as fh:
+    # Contain the write under the output folder (e.g. the analysis.json folder) so a
+    # symlinked reports/ subfolder can't redirect it; fall back to the file's own folder.
+    with safe_io.open_write_nofollow(output_path,
+                                     root=(output_root or output_dir or ".")) as fh:
         fh.write("\n".join(parts))
 
     print(f"Dashboard generated -> {output_path}")
@@ -1364,24 +1389,29 @@ def _html_compliance_section(compliance: dict) -> str:
             total = info.get("total", 0)
             passed = info.get("pass", info.get("passed", 0))
             rate = info.get("pass_rate")
-            if rate is None:
-                rate = round((passed / total * 100), 1) if total > 0 else 0
+            # A malformed rate must never reach the inline style attribute, but it also
+            # must not take down the whole dashboard: skip just this card with a warning.
             try:
+                if rate is None:
+                    rate = round((float(passed) / float(total) * 100), 1) if float(total) > 0 else 0
                 numeric_rate = float(rate)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("Compliance pass rate must be numeric") from exc
-            if not math.isfinite(numeric_rate):
-                raise ValueError("Compliance pass rate must be finite")
-            if not 0 <= numeric_rate <= 100:
-                raise ValueError("Compliance pass rate must be between 0 and 100")
+                if not math.isfinite(numeric_rate) or not 0 <= numeric_rate <= 100:
+                    raise ValueError(rate)
+            except (TypeError, ValueError, ZeroDivisionError):
+                print(f"  [WARN] Skipping compliance card {fw!r}: pass rate {rate!r} is not "
+                      "a number between 0 and 100.", file=sys.stderr)
+                continue
             color = ("#28a745" if numeric_rate >= 80 else
                      "#fd7e14" if numeric_rate >= 50 else "#dc3545")
             req_total = info.get("requirements_total")
             if req_total:
                 req_passed = info.get("requirements_passed", 0)
-                req_rate = info.get(
-                    "requirements_pass_rate", round(req_passed / req_total * 100, 1)
-                )
+                try:
+                    req_rate = info.get("requirements_pass_rate")
+                    if req_rate is None:
+                        req_rate = round(float(req_passed) / float(req_total) * 100, 1)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    req_rate = "n/a"
                 req_line = (f'<div class="small text-muted mb-2">Requirements Met: '
                             f'{_esc(req_passed)} / {_esc(req_total)} ({_esc(req_rate)}%)</div>')
             elif req_total is not None:
@@ -2070,7 +2100,9 @@ def main():
     args = parser.parse_args()
 
     data = load_analysis(args.analysis_json)
-    generate_html(data, args.output_html)
+    generate_html(data, args.output_html,
+                  output_root=safe_io.containment_root(
+                      args.output_html, os.path.dirname(args.analysis_json)))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+import safe_io
 
 try:
     import matplotlib
@@ -27,9 +28,23 @@ except ImportError:
     sys.exit(1)
 
 
+def _plain(label) -> str:
+    """Render a scan-derived label literally. Matplotlib treats paired ``$...$`` as
+    mathtext, so a crafted service/framework name could inject math markup or raise
+    on invalid syntax and abort chart generation; escaping ``$`` keeps it plain text."""
+    return str(label).replace("$", r"\$")
+
+
 def load_analysis(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def save_chart(output_path: str):
+    """Write the active Matplotlib figure without following a planted output link."""
+    output_root = os.path.dirname(os.path.abspath(output_path)) or "."
+    with safe_io.open_write_nofollow(output_path, binary=True, root=output_root) as fh:
+        plt.savefig(fh, dpi=150, bbox_inches="tight", transparent=True)
 
 
 def generate_severity_donut(severity: dict, output_path: str):
@@ -56,7 +71,7 @@ def generate_severity_donut(severity: dict, output_path: str):
     )
     ax.set_title("Findings by Severity", fontsize=14, fontweight="bold", pad=16)
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight", transparent=True)
+    save_chart(output_path)
     plt.close()
     print(f"  + Severity donut -> {output_path}")
 
@@ -67,7 +82,7 @@ def generate_service_bar(by_service: dict, output_path: str):
     values = [by_service[s] for s in services]
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 5))
-    bars = ax.barh(services[::-1], values[::-1], color="#f57c00", edgecolor="none")
+    bars = ax.barh([_plain(s) for s in services[::-1]], values[::-1], color="#f57c00", edgecolor="none")
     ax.set_xlabel("Failed Checks", fontsize=11)
     ax.set_title("Top Services with Security Failures", fontsize=14, fontweight="bold", pad=12)
     ax.spines["top"].set_visible(False)
@@ -78,7 +93,7 @@ def generate_service_bar(by_service: dict, output_path: str):
                 str(val), va="center", fontsize=10)
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight", transparent=True)
+    save_chart(output_path)
     plt.close()
     print(f"  + Service bar chart -> {output_path}")
 
@@ -106,7 +121,7 @@ def generate_score_gauge(score: float, output_path: str):
     ax.set_aspect("equal")
     ax.axis("off")
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight", transparent=True)
+    save_chart(output_path)
     plt.close()
     print(f"  + Score gauge -> {output_path}")
 
@@ -117,7 +132,7 @@ def generate_compliance_bar(compliance: dict, output_path: str):
         fig, ax = plt.subplots(1, 1, figsize=(6, 4))
         ax.text(0.5, 0.5, "No compliance data available", ha="center", va="center", fontsize=14)
         ax.axis("off")
-        plt.savefig(output_path, dpi=150, bbox_inches="tight", transparent=True)
+        save_chart(output_path)
         plt.close()
         print(f"  + Compliance chart (empty) -> {output_path}")
         return
@@ -127,7 +142,7 @@ def generate_compliance_bar(compliance: dict, output_path: str):
     colors = ["#388e3c" if r >= 80 else "#f57c00" if r >= 50 else "#d32f2f" for r in rates]
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 4))
-    bars = ax.barh(frameworks[::-1], rates[::-1], color=colors[::-1], edgecolor="none")
+    bars = ax.barh([_plain(f) for f in frameworks[::-1]], rates[::-1], color=colors[::-1], edgecolor="none")
     ax.set_xlabel("Pass Rate (%)", fontsize=11)
     ax.set_xlim(0, 100)
     ax.set_title("Compliance Framework Coverage", fontsize=14, fontweight="bold", pad=12)
@@ -139,7 +154,7 @@ def generate_compliance_bar(compliance: dict, output_path: str):
                 f"{rate}%", va="center", fontsize=10)
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight", transparent=True)
+    save_chart(output_path)
     plt.close()
     print(f"  + Compliance chart -> {output_path}")
 
@@ -169,7 +184,7 @@ def generate_provider_bar(by_provider: dict, output_path: str):
         bottom += np.array(vals)
 
     ax.set_xticks(idx)
-    ax.set_xticklabels(labels)
+    ax.set_xticklabels([_plain(label) for label in labels])
     ax.set_ylabel("Failed Checks", fontsize=11)
     ax.set_title("Findings by Cloud Provider", fontsize=14, fontweight="bold", pad=12)
     ax.spines["top"].set_visible(False)
@@ -177,7 +192,7 @@ def generate_provider_bar(by_provider: dict, output_path: str):
     ax.legend(fontsize=9)
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight", transparent=True)
+    save_chart(output_path)
     plt.close()
     print(f"  + Provider breakdown chart -> {output_path}")
 
@@ -189,7 +204,11 @@ def main():
     args = parser.parse_args()
 
     data = load_analysis(args.analysis_json)
-    os.makedirs(args.output_dir, exist_ok=True)
+    if os.path.lexists(args.output_dir) and os.path.islink(args.output_dir):
+        print(f"ERROR: refusing to write charts to a symlinked directory: {args.output_dir}",
+              file=sys.stderr)
+        sys.exit(1)
+    os.makedirs(args.output_dir, mode=0o700, exist_ok=True)
 
     summary = data["summary"]
     print("Generating charts for PPTX deck...")

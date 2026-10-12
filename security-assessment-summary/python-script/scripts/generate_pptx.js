@@ -46,6 +46,94 @@ const providers = ((data.metadata && data.metadata.providers && data.metadata.pr
 const providerLabels = providers.map((p) => PROVIDER_LABEL[p] || p.toUpperCase()).join(", ");
 const multiProvider = providers.length > 1;
 
+function normalizedPptxPath(fileName) {
+  return fileName.toLowerCase().endsWith(".pptx") ? fileName : `${fileName}.pptx`;
+}
+
+function outputContainmentRoot(fileName) {
+  const absolutePath = path.resolve(fileName);
+  const pathRoot = path.parse(absolutePath).root;
+  const components = absolutePath.slice(pathRoot.length).split(path.sep).filter(Boolean);
+  const reportsIndex = components.lastIndexOf("reports");
+  // The assessment workflow places decks under <deliverables>/reports/, possibly
+  // in a nested reports subfolder. Anchor to the directory before reports so
+  // every descendant is checked against the deliverables tree.
+  return reportsIndex >= 0
+    ? path.join(pathRoot, ...components.slice(0, reportsIndex))
+    : path.dirname(absolutePath);
+}
+
+function createSafeOutputDirectory(outputDir, containmentRoot) {
+  const rootPath = path.resolve(containmentRoot);
+  const targetPath = path.resolve(outputDir);
+  const relativeTarget = path.relative(rootPath, targetPath);
+  if (relativeTarget === ".." || relativeTarget.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relativeTarget)) {
+    throw new Error(`Refusing PPTX output outside intended directory: ${outputDir}`);
+  }
+
+  // Create each component individually and reject a symlink before stepping
+  // through it. This catches a planted reports/ link before mkdir can create a
+  // nested directory on its target.
+  fs.mkdirSync(rootPath, { recursive: true });
+  const rootStat = fs.lstatSync(rootPath);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`Refusing PPTX containment directory that is not a real directory: ${rootPath}`);
+  }
+  let current = rootPath;
+  for (const component of relativeTarget.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    try {
+      fs.mkdirSync(current);
+    } catch (err) {
+      if (err.code !== "EEXIST") throw err;
+    }
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Refusing PPTX output directory that is not a real directory: ${current}`);
+    }
+  }
+}
+
+function writePptxSafely(presentation, requestedPath) {
+  const fileName = normalizedPptxPath(requestedPath);
+  const outputDir = path.dirname(fileName);
+  const containmentRoot = outputContainmentRoot(fileName);
+  const noFollow = fs.constants.O_NOFOLLOW;
+  if (typeof noFollow !== "number" || noFollow === 0) {
+    throw new Error("Refusing to write PPTX: O_NOFOLLOW is unavailable on this platform");
+  }
+  createSafeOutputDirectory(outputDir, containmentRoot);
+
+  // Generate the document in memory, then open the final path exactly once with
+  // O_NOFOLLOW. This prevents a planted final-component symlink from redirecting
+  // the write to its target; component-by-component directory validation blocks
+  // a planted reports/ symlink. Directory replacement races are out of scope
+  // because they require write access to the output parent.
+  return presentation.write({ outputType: "nodebuffer" }).then((buffer) => {
+    let fd;
+    try {
+      // No O_TRUNC at open: verify first that the path is a regular file with a single
+      // link owned by us, so a planted HARD link can't make us truncate another file.
+      fd = fs.openSync(
+        fileName,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | noFollow,
+        0o600,
+      );
+      const st = fs.fstatSync(fd);
+      const uid = typeof process.geteuid === "function" ? process.geteuid() : st.uid;
+      if (!st.isFile() || st.nlink !== 1 || st.uid !== uid) {
+        throw new Error(`Refusing to write PPTX: ${fileName} is not a single-link regular file owned by this user`);
+      }
+      fs.ftruncateSync(fd, 0);
+      fs.writeFileSync(fd, buffer);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+    return fileName;
+  });
+}
+
 // The chart generator emits PNGs only. Rejecting every other image type before
 // PptxGenJS receives it keeps its generic image-size parser off untrusted formats.
 function assertSafePng(imagePath) {
@@ -108,6 +196,13 @@ slide.addText("Cloud Security Assessment", { x: 0.8, y: 1.5, w: 8.4, h: 0.8, fon
 slide.addText(customer, { x: 0.8, y: 2.4, w: 8.4, h: 0.6, fontSize: 22, color: ACCENT });
 slide.addText(`${providerLabels}  |  ${scanDate}  |  Confidential`, { x: 0.8, y: 3.2, w: 8.4, h: 0.4, fontSize: 14, color: "AAAAAA" });
 slide.addText("Powered by Prowler", { x: 0.8, y: 4.8, w: 4, h: 0.3, fontSize: 11, color: "777777" });
+// Safety limits hit during analysis mean the numbers below are partial — say so up front.
+const inputLimits = (data.metadata && Array.isArray(data.metadata.input_limits_applied))
+  ? data.metadata.input_limits_applied : [];
+if (inputLimits.length) {
+  slide.addText(`PARTIAL RESULTS: safety limits applied while reading the scan input (${inputLimits.join("; ")})`,
+    { x: 0.8, y: 4.1, w: 8.4, h: 0.5, fontSize: 11, bold: true, color: "F57C00" });
+}
 
 // ---------------------------------------------------------------------------
 // Slide 2: Executive Summary
@@ -142,6 +237,9 @@ const insights = [
   `${severity.critical + severity.high} Critical/High findings require immediate attention`,
   `${serviceCountLabel} cloud services with security findings`,
 ];
+if (inputLimits.length) {
+  insights.push("PARTIAL RESULTS: some input was skipped by safety limits; findings and score may be incomplete");
+}
 insights.forEach((text, i) => {
   slide.addText(`• ${text}`, { x: 0.7, y: 2.5 + i * 0.4, w: 8.7, h: 0.35, fontSize: 12, color: SLATE });
 });
@@ -288,9 +386,6 @@ slide.addText("Questions on findings or remediation? Let's discuss next steps.",
 // ---------------------------------------------------------------------------
 // Save
 // ---------------------------------------------------------------------------
-const outDir = path.dirname(outputPath);
-if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-
-pres.writeFile({ fileName: outputPath })
-  .then(() => console.log(`✅ PPTX deck generated → ${outputPath}`))
+writePptxSafely(pres, outputPath)
+  .then((fileName) => console.log(`✅ PPTX deck generated → ${fileName}`))
   .catch((err) => { console.error("ERROR generating PPTX:", err); process.exit(1); });
