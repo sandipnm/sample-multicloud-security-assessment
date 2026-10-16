@@ -19,14 +19,14 @@ A Kiro CLI agent that analyzes multi-cloud **Prowler security assessment outputs
 
 ## Requirements
 
-- **Python 3.9+** with packages: `matplotlib`, `numpy`, `reportlab`
+- **Python 3.12+** (packages are pinned with hashes in `python-script/scripts/requirements.txt`)
 - **Node.js 18+** with package: `pptxgenjs`
 - **Kiro CLI** installed and configured
 
 ### Install Python dependencies
 
 ```bash
-pip3 install matplotlib numpy reportlab
+pip3 install --require-hashes -r ../python-script/scripts/requirements.txt
 ```
 
 ### Install Node dependencies
@@ -34,7 +34,7 @@ pip3 install matplotlib numpy reportlab
 From `security-assessment-summary/kiro-agent/`:
 
 ```bash
-(cd ../python-script/scripts && npm install)
+(cd ../python-script/scripts && npm ci --ignore-scripts)
 ```
 
 ## Supported Input Formats

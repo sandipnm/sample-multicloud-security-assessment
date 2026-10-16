@@ -49,14 +49,14 @@ A single input folder may contain scans from more than one cloud.
 
 ## Requirements
 
-- **Python 3.9+** with packages: `matplotlib`, `numpy`, `reportlab`
+- **Python 3.12+** (packages are pinned with hashes in `python-script/scripts/requirements.txt`)
 - **Node.js 18+** with package: `pptxgenjs`
 - For Terraform deployment: **Terraform CLI** + relevant provider CLI (`aws` / `az` / `gcloud` / `oci`)
 
 ```bash
-pip3 install matplotlib numpy reportlab
+pip3 install --require-hashes -r python-script/scripts/requirements.txt
 # pptxgenjs lives with the shared scripts; all three variants use this one install.
-cd python-script/scripts && npm install
+cd python-script/scripts && npm ci --ignore-scripts
 ```
 
 ## Quick Start

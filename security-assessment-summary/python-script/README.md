@@ -18,13 +18,13 @@ Prowler emits the **same findings in multiple formats**, so the analyzer parses 
 
 ## Requirements
 
-- **Python 3.9+** with: `matplotlib`, `numpy`, `reportlab`
+- **Python 3.12+** (packages are pinned with hashes in `scripts/requirements.txt`)
 - **Node.js 18+** with: `pptxgenjs`
 - To deploy the generated IaC: **Terraform** + the relevant provider CLI (`aws` / `az` / `gcloud` / `oci`)
 
 ```bash
-pip3 install matplotlib numpy reportlab
-cd scripts && npm install
+pip3 install --require-hashes -r scripts/requirements.txt
+cd scripts && npm ci --ignore-scripts
 ```
 
 ## Scripts

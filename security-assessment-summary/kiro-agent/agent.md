@@ -377,10 +377,10 @@ python3 "$SCRIPTS/analyze_security_data.py" ...
 Note that the PPTX step `cd`s into the scripts directory; `OUT_DIR` is absolute, so the
 command still resolves.
 
-Python packages (install if not present):
-- matplotlib
-- numpy
-- reportlab
+Python packages (Python 3.12+; exact versions with hashes, install if not present):
+```bash
+pip3 install --require-hashes -r ../python-script/scripts/requirements.txt
+```
 
 Node package (install once in `../python-script/scripts/`):
 - pptxgenjs

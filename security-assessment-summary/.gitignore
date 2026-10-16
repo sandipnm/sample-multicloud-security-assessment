@@ -43,3 +43,6 @@ security/
 # because Git ignores .gitignore for already-tracked files).
 !samples/
 !samples/**
+
+# Local Holmes MCP state
+.holmes/
