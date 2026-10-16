@@ -200,6 +200,8 @@ def generate_readme(data: dict, output_path: str, output_root: str = None):
     s.append("### Deployment\n")
     s.append("```bash")
     s.append("cd iac/")
+    s.append("# First run only: this folder must hold no state or lock file you did not create")
+    s.append("ls -a | grep -Ei 'tfstate|\\.terraform' && echo 'STOP: review before init'")
     s.append("terraform init")
     s.append("terraform validate")
     s.append("terraform plan -out=tfplan   # REVIEW this plan carefully")

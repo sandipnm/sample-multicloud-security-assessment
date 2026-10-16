@@ -161,16 +161,14 @@ function assertSafePng(imagePath) {
   return imagePath;
 }
 
-// Chart paths (support both new and legacy names).
-function chartPath(...names) {
-  for (const n of names) {
-    const p = path.join(chartsDir, n);
-    if (fs.existsSync(p)) return assertSafePng(p);
-  }
-  return null;
+// Chart paths: only the names generate_charts.py writes. Legacy aliases were dropped so
+// a PNG planted under an old name in charts/ can't stand in for the real chart.
+function chartPath(name) {
+  const p = path.join(chartsDir, name);
+  return fs.existsSync(p) ? assertSafePng(p) : null;
 }
-const severityChart = chartPath("sev_donut.png", "severity_donut.png");
-const serviceChart = chartPath("svc_bar.png", "service_bar.png");
+const severityChart = chartPath("severity_donut.png");
+const serviceChart = chartPath("service_bar.png");
 const scoreChart = chartPath("score_gauge.png");
 const complianceChart = chartPath("compliance_bar.png");
 const providerChart = chartPath("provider_bar.png");

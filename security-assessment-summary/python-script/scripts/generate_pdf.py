@@ -86,8 +86,8 @@ def header_footer(canvas, doc):
 def _chart(charts_dir, name, width=5.5 * inch):
     """Return a reportlab Image flowable if the chart PNG exists, else None.
 
-    `name` may be a single base name or a tuple of alias base names; the first
-    matching file wins (covers both sev_donut/severity_donut style names).
+    `name` is the base name generate_charts.py writes. No legacy aliases: a PNG planted
+    under an old name in charts/ must not stand in for the real chart.
     """
     if not charts_dir:
         return None
@@ -211,8 +211,8 @@ def build_pdf(data: dict, output_path: str, charts_dir: str = "", output_root: s
 
     # Findings Summary + severity + service charts
     E.append(Paragraph("2. Findings Summary", styles["SectionHead"]))
-    for cname, cap in ((("severity_donut", "sev_donut"), "Findings by Severity"),
-                       (("service_bar", "svc_bar"), "Top Services by Failed Checks")):
+    for cname, cap in (("severity_donut", "Findings by Severity"),
+                       ("service_bar", "Top Services by Failed Checks")):
         img = _chart(charts_dir, cname)
         if img:
             E.append(KeepTogether([

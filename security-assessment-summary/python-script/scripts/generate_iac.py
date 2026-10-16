@@ -1262,10 +1262,16 @@ _LEGACY_MODULE_NAME = re.compile(r"^.+_(aws|azure|gcp|oci)_[a-z0-9_]+\.tf$")
 
 
 def _terraform_loads(name: str) -> bool:
-    """True for directory entries Terraform reads or executes on init/plan/apply."""
+    """True for directory entries Terraform reads or executes on init/plan/apply.
+
+    Includes local-backend state and the dependency lock file: `terraform init` installs
+    every provider named in state (not only in config) and `plan`/`apply` act on the
+    resource IDs state maps, so a planted terraform.tfstate is as dangerous as a .tf."""
     lower = name.lower()
     return (lower.endswith((".tf", ".tf.json", ".auto.tfvars", ".auto.tfvars.json"))
-            or lower in ("terraform.tfvars", "terraform.tfvars.json", ".terraform"))
+            or ".tfstate" in lower
+            or lower in ("terraform.tfvars", "terraform.tfvars.json", ".terraform",
+                         ".terraform.lock.hcl", "terraform.tfstate.d"))
 
 
 def _sha256_file(path: str) -> str:
@@ -1409,7 +1415,7 @@ def generate_terraform(customer: str, provider: str, selections: list, output_di
     _conflicts = [n for n in _targets
                   if os.path.lexists(os.path.join(output_dir, n)) and n not in _prior]
     # Terraform loads EVERY *.tf / *.tf.json / *.auto.tfvars / terraform.tfvars in the
-    # directory (and runs providers from .terraform/). The default output folder lives
+    # directory (and runs providers from .terraform/ and from local state). The default output folder lives
     # inside the untrusted input tree, so an archive could plant e.g. backdoor.tf with
     # data "external". Refuse anything Terraform would load that we did not generate.
     # The manifest itself sits in that untrusted tree, so a manifest entry only vouches for
@@ -1447,14 +1453,21 @@ def generate_terraform(customer: str, provider: str, selections: list, output_di
               ".cloud-sec-assessment-backup/, never deleted).", file=sys.stderr)
         return []
 
-    _backup_dir = os.path.join(output_dir, ".cloud-sec-assessment-backup",
-                               datetime.now().strftime("%Y%m%dT%H%M%S"))
+    _backup_root = os.path.join(output_dir, ".cloud-sec-assessment-backup")
+    _backup_dir = os.path.join(_backup_root, datetime.now().strftime("%Y%m%dT%H%M%S"))
+    # The backup folder sits in the untrusted tree too: refuse a planted symlink (or file)
+    # there BEFORE touching anything, so backed-up files can't be moved outside the root.
+    if os.path.lexists(_backup_root) and (os.path.islink(_backup_root)
+                                          or not os.path.isdir(_backup_root)):
+        print(f"  [ERROR] {_backup_root} is a symlink or not a directory. Nothing was "
+              "changed. Remove it and re-run.", file=sys.stderr)
+        return []
     for name in sorted(set(_prior) | set(_conflicts) | set(_unknown)):
         if name in _unknown:
             # Forced: quarantine unknown Terraform-loaded entries (incl. .terraform/).
             path = os.path.join(output_dir, name)
             if os.path.lexists(path):
-                os.makedirs(_backup_dir, mode=0o700, exist_ok=True)
+                safe_io.ensure_dir_within(_backup_dir, output_dir, mode=0o700)
                 os.replace(path, os.path.join(_backup_dir, name))
                 print(f"  ↪ quarantined {name} → {os.path.relpath(_backup_dir, output_dir)}/",
                       file=sys.stderr)
@@ -1466,7 +1479,7 @@ def generate_terraform(customer: str, provider: str, selections: list, output_di
             os.remove(target)
             print(f"  - removed stale generated file {name}")
         else:
-            os.makedirs(_backup_dir, mode=0o700, exist_ok=True)
+            safe_io.ensure_dir_within(_backup_dir, output_dir, mode=0o700)
             os.replace(target, os.path.join(_backup_dir, name))
             print(f"  ↪ backed up {name} → {os.path.relpath(_backup_dir, output_dir)}/",
                   file=sys.stderr)

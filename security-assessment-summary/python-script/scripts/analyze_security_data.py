@@ -179,15 +179,14 @@ def _is_within(path: Path, parent: Path) -> bool:
 
 
 def _has_tool_artifacts(folder: Path) -> bool:
-    """True if ``folder`` holds any artifact this tool writes. analysis.json alone is not
-    enough: a run may write it elsewhere (custom output_json) while the dashboard,
-    README and Terraform still land in the folder."""
+    """True if ``folder`` holds an artifact only this tool writes. analysis.json alone is
+    not enough: a run may write it elsewhere (custom output_json) while the dashboard and
+    Terraform still land in the folder. Generic names (e.g. ``*_README.md``) are NOT a
+    signature: a customer folder holding one would be silently dropped as output."""
     try:
         if (folder / "analysis.json").is_file():
             return True
         if (folder / "iac" / ".cloud-sec-assessment-manifest.json").is_file():
-            return True
-        if any(folder.glob("*_README.md")):
             return True
         return any((folder / "reports").glob("*_Security_Dashboard.html"))
     except OSError:
@@ -367,6 +366,10 @@ def identify_files(folder_path: str, excluded_roots: list = None,
                             and (f.name == "assessment-summary"
                                  or f.name.startswith("assessment-summary-"))
                             and _has_tool_artifacts(f)):
+                        # Visible, not a partial-results notice: re-runs prune their own
+                        # output folder every time.
+                        print(f"  [INFO] Skipping generated output folder: {f}",
+                              file=sys.stderr)
                         continue
                     pending_dirs.append(f)
                     continue
@@ -1134,6 +1137,9 @@ _EMBEDDED_ID_PATTERNS = [
 _GCP_PROJECT_PATTERN = re.compile(r"(?:^|[/\s\"'])projects/([a-z][a-z0-9-]{4,28}[a-z0-9])(?=/|$|\")")
 
 
+_GCP_URL_LOOKBACK = 2048
+
+
 def _gcp_project_ids(text: str) -> set:
     """GCP project IDs in resource-path form (projects/<id>/...). Real IDs almost always
     contain a digit or hyphen; requiring one avoids masking words like 'locations'.
@@ -1144,8 +1150,12 @@ def _gcp_project_ids(text: str) -> set:
         project = m.group(1)
         if not any(c.isdigit() or c == "-" for c in project):
             continue
-        token_start = max(text.rfind(ch, 0, m.start(1)) for ch in " \t\r\n\"'") + 1
-        prefix = text[token_start:m.start(1)]
+        # Bounded look-back: an unbounded rfind rescans the whole text for every match
+        # (quadratic on large blobs). A token longer than the window is treated as
+        # not-a-URL, which errs toward masking.
+        window_start = max(0, m.start(1) - _GCP_URL_LOOKBACK)
+        window = text[window_start:m.start(1)]
+        prefix = window[max(window.rfind(ch) for ch in " \t\r\n\"'") + 1:]
         if "://" in prefix:
             # API selfLinks (https://compute.googleapis.com/.../projects/<id>/...) DO name
             # a project; any other URL is documentation.
