@@ -62,6 +62,40 @@ def containment_root(output_path: str, anchor_dir: str):
     return None
 
 
+def ensure_dir_within(directory: str, root: str, mode: int = 0o777) -> None:
+    """Create ``directory`` (and parents) under ``root`` without following symlinks.
+
+    Every existing component between ``root`` and ``directory`` is checked (no symlinks,
+    must be a directory) BEFORE anything is created, so a planted symlinked subfolder
+    can't make us create directories outside the root.
+    """
+    parent = os.path.abspath(directory)
+    root_abs = os.path.abspath(root)
+    if parent != root_abs and not parent.startswith(root_abs + os.sep):
+        raise UnsafeOutputPathError(
+            f"refusing to write outside output root: parent {parent} not under {root_abs}")
+    if not os.path.lexists(root_abs):
+        os.makedirs(root_abs, mode)  # the root itself is operator-chosen; create it if missing
+    current = root_abs
+    rel = os.path.relpath(parent, root_abs)
+    for part in ([] if rel == "." else rel.split(os.sep)):
+        current = os.path.join(current, part)
+        if os.path.lexists(current):
+            if os.path.islink(current) or not os.path.isdir(current):
+                raise UnsafeOutputPathError(
+                    f"refusing to write via symlinked/non-directory component: {current}")
+        else:
+            os.mkdir(current, mode)
+    # Defense in depth: the fully resolved parent must stay under the resolved root
+    # (both sides canonicalize benign symlinks such as macOS /tmp -> /private/tmp).
+    parent_real = os.path.realpath(parent)
+    root_real = os.path.realpath(root_abs)
+    if parent_real != root_real and not parent_real.startswith(root_real + os.sep):
+        raise UnsafeOutputPathError(
+            f"refusing to write outside output root: parent {parent_real} "
+            f"not under {root_real}")
+
+
 def open_write_nofollow(path: str, binary: bool = False, root: str = None):
     """Open ``path`` for writing, refusing to follow a symlink at the final component
     AND refusing a parent directory that resolves outside ``root`` (when given).
@@ -73,10 +107,8 @@ def open_write_nofollow(path: str, binary: bool = False, root: str = None):
     redirect the write outside the intended tree. If ``root`` is the file's own parent,
     only ``..`` escapes are caught.
 
-    Parent directories are created if missing — but when ``root`` is given, every
-    existing component between ``root`` and the file is checked (no symlinks) BEFORE
-    anything is created, so a planted symlinked subfolder can't make us create
-    directories outside the root.
+    Parent directories are created if missing — when ``root`` is given, via
+    :func:`ensure_dir_within`, so nothing is created outside the root.
 
     The file is opened WITHOUT O_TRUNC and only truncated after ``fstat`` confirms it
     is a regular file with a single link owned by this user, so a planted HARD link
@@ -84,33 +116,13 @@ def open_write_nofollow(path: str, binary: bool = False, root: str = None):
     """
     parent = os.path.abspath(os.path.dirname(path) or ".")
     if root is not None:
-        root_abs = os.path.abspath(root)
-        if parent != root_abs and not parent.startswith(root_abs + os.sep):
-            raise UnsafeOutputPathError(
-                f"refusing to write outside output root: parent {parent} not under {root_abs}")
-        if not os.path.lexists(root_abs):
-            os.makedirs(root_abs)  # the root itself is operator-chosen; create it if missing
-        current = root_abs
-        rel = os.path.relpath(parent, root_abs)
-        for part in ([] if rel == "." else rel.split(os.sep)):
-            current = os.path.join(current, part)
-            if os.path.lexists(current):
-                if os.path.islink(current) or not os.path.isdir(current):
-                    raise UnsafeOutputPathError(
-                        f"refusing to write via symlinked/non-directory component: {current}")
-            else:
-                os.mkdir(current)
-        # Defense in depth: the fully resolved parent must stay under the resolved root
-        # (both sides canonicalize benign symlinks such as macOS /tmp -> /private/tmp).
-        parent_real = os.path.realpath(parent)
-        root_real = os.path.realpath(root_abs)
-        if parent_real != root_real and not parent_real.startswith(root_real + os.sep):
-            raise UnsafeOutputPathError(
-                f"refusing to write outside output root: parent {parent_real} "
-                f"not under {root_real}")
+        ensure_dir_within(parent, root)
     else:
         os.makedirs(parent, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK: opening a planted FIFO for writing would otherwise block forever
+    # waiting for a reader, before the regular-file check below ever runs.
+    flags = (os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0))
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as e:
@@ -124,6 +136,8 @@ def open_write_nofollow(path: str, binary: bool = False, root: str = None):
             raise UnsafeOutputPathError(
                 f"refusing to write output at {path}: not a single-link regular file "
                 "owned by this user (possible hard-link redirect)")
+        if hasattr(os, "set_blocking"):
+            os.set_blocking(fd, True)
         os.ftruncate(fd, 0)
     except BaseException:
         os.close(fd)

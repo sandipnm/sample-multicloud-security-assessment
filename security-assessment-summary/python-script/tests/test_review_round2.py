@@ -299,10 +299,19 @@ class AnalyzerInputTests(unittest.TestCase):
             self.assertNotIn(sub, out.read_text(encoding="utf-8"))
 
     def test_gcp_project_in_any_field_is_masked_and_swept(self):
-        findings = [{"RESOURCE_UID": "", "STATUS_EXTENDED":
+        findings = [{"PROVIDER": "gcp", "RESOURCE_UID": "", "STATUS_EXTENDED":
                      "Bucket projects/acme-prod-123/buckets/b is public"}]
         ids = analyzer.extract_embedded_scope_ids(findings)
         self.assertIn("acme-prod-123", ids)
+
+    def test_gcp_pattern_ignores_doc_urls_and_other_providers(self):
+        doc = "See https://cloud.google.com/sdk/gcloud/reference/projects/add-iam-policy-binding"
+        self.assertEqual(analyzer._gcp_project_ids(doc), set())
+        self.assertEqual(analyzer._gcp_project_ids(
+            "https://www.googleapis.com/compute/v1/projects/acme-prod-123/zones/z"),
+            {"acme-prod-123"})
+        self.assertEqual(analyzer.extract_embedded_scope_ids(
+            [{"PROVIDER": "aws", "RISK": "Bucket projects/acme-prod-123/x"}]), set())
         self.assertNotIn("locations", analyzer._gcp_project_ids("x/projects/locations/y"))
         self.assertEqual(analyzer.verify_anonymization({"a": "projects/acme-prod-123/x"}, {}),
                          ["acme-prod-123"])

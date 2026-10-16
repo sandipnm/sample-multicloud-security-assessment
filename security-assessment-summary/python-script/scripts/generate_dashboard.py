@@ -449,9 +449,9 @@ def generate_html(data: dict, output_path: str, output_root: str = None):
     ))
     parts.append("</body>\n</html>")
 
+    # No os.makedirs here: open_write_nofollow creates missing folders only after
+    # checking every existing component under the root for symlinks.
     output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
     # Contain the write under the output folder (e.g. the analysis.json folder) so a
     # symlinked reports/ subfolder can't redirect it; fall back to the file's own folder.
     with safe_io.open_write_nofollow(output_path,

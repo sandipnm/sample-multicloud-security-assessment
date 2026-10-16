@@ -75,10 +75,12 @@ function createSafeOutputDirectory(outputDir, containmentRoot) {
   // Create each component individually and reject a symlink before stepping
   // through it. This catches a planted reports/ link before mkdir can create a
   // nested directory on its target.
+  // The root itself is operator-chosen (like safe_io.py), so a benign symlink there
+  // (macOS /tmp -> /private/tmp, ~/work -> /Volumes/...) is tolerated; only components
+  // BELOW it must be real directories.
   fs.mkdirSync(rootPath, { recursive: true });
-  const rootStat = fs.lstatSync(rootPath);
-  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-    throw new Error(`Refusing PPTX containment directory that is not a real directory: ${rootPath}`);
+  if (!fs.statSync(rootPath).isDirectory()) {
+    throw new Error(`Refusing PPTX containment directory that is not a directory: ${rootPath}`);
   }
   let current = rootPath;
   for (const component of relativeTarget.split(path.sep).filter(Boolean)) {
@@ -92,6 +94,12 @@ function createSafeOutputDirectory(outputDir, containmentRoot) {
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
       throw new Error(`Refusing PPTX output directory that is not a real directory: ${current}`);
     }
+  }
+  // Defense in depth: the resolved target must stay under the resolved root.
+  const rootReal = fs.realpathSync(rootPath);
+  const targetRel = path.relative(rootReal, fs.realpathSync(targetPath));
+  if (targetRel === ".." || targetRel.startsWith(`..${path.sep}`) || path.isAbsolute(targetRel)) {
+    throw new Error(`Refusing PPTX output outside intended directory: ${outputDir}`);
   }
 }
 
@@ -115,9 +123,10 @@ function writePptxSafely(presentation, requestedPath) {
     try {
       // No O_TRUNC at open: verify first that the path is a regular file with a single
       // link owned by us, so a planted HARD link can't make us truncate another file.
+      // O_NONBLOCK: a planted FIFO would otherwise block the open forever.
       fd = fs.openSync(
         fileName,
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | noFollow,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | noFollow | (fs.constants.O_NONBLOCK || 0),
         0o600,
       );
       const st = fs.fstatSync(fd);

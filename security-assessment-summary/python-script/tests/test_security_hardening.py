@@ -481,7 +481,9 @@ class PptxOutputSymlinkTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stderr)
             self.assertFalse((elsewhere / "nested" / "deck.pptx").exists())
 
-    def test_pptx_write_refuses_symlinked_deliverables_root(self):
+    def test_pptx_write_follows_symlinked_deliverables_root(self):
+        # Like safe_io.py: the operator-chosen root may be a symlink (macOS /tmp,
+        # ~/work -> /Volumes/...); only components BELOW it must be real directories.
         if not shutil.which("node") or not (SCRIPTS_DIR / "node_modules" / "pptxgenjs").exists():
             self.skipTest("Node.js and pptxgenjs are required")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -499,8 +501,8 @@ class PptxOutputSymlinkTests(unittest.TestCase):
             result = self._run_pptx(analysis, root,
                                     deliverables / "reports" / "deck.pptx")
 
-            self.assertNotEqual(result.returncode, 0, result.stderr)
-            self.assertFalse((elsewhere / "reports" / "deck.pptx").exists())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((elsewhere / "reports" / "deck.pptx").is_file())
 
     def test_pptx_write_preserves_normal_output_and_suffix_behavior(self):
         if not shutil.which("node") or not (SCRIPTS_DIR / "node_modules" / "pptxgenjs").exists():

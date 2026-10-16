@@ -1412,9 +1412,17 @@ def generate_terraform(customer: str, provider: str, selections: list, output_di
     # directory (and runs providers from .terraform/). The default output folder lives
     # inside the untrusted input tree, so an archive could plant e.g. backdoor.tf with
     # data "external". Refuse anything Terraform would load that we did not generate.
+    # The manifest itself sits in that untrusted tree, so a manifest entry only vouches for
+    # a plain regular file (the only thing this tool writes). A listed .terraform/ folder or
+    # symlinked .tf would otherwise skip this refusal AND the cleanup below.
+    def _is_plain_file(name):
+        path = os.path.join(output_dir, name)
+        return not os.path.islink(path) and os.path.isfile(path)
+
     _unknown = sorted(
         n for n in os.listdir(output_dir)
-        if n not in _prior and n not in _targets and _terraform_loads(n))
+        if _terraform_loads(n)
+        and not ((n in _prior or n in _targets) and _is_plain_file(n)))
     if keep_existing and _unknown:
         print(f"  [WARN] Keeping operator Terraform file(s) Terraform will also load: "
               f"{', '.join(_unknown)} (--keep-existing-terraform).", file=sys.stderr)

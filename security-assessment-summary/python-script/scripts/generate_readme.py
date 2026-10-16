@@ -266,9 +266,9 @@ def generate_readme(data: dict, output_path: str, output_root: str = None):
     s.append("---\n")
     s.append(f"*Generated on {scan_date} by the Cloud Security Assessment tool.*\n")
 
+    # No os.makedirs here: open_write_nofollow creates missing folders only after
+    # checking every existing component under the root for symlinks.
     output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
     # Contain the write under the output folder (see safe_io.containment_root).
     with safe_io.open_write_nofollow(output_path,
                                      root=(output_root or output_dir or ".")) as fh:

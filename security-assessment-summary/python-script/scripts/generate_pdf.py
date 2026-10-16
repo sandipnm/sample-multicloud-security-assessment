@@ -109,7 +109,7 @@ def _chart(charts_dir, name, width=5.5 * inch):
     return None
 
 
-def build_pdf(data: dict, output_path: str, charts_dir: str = ""):
+def build_pdf(data: dict, output_path: str, charts_dir: str = "", output_root: str = None):
     meta = data.get("metadata", {})
     customer = meta.get("customer", "Customer")
     scan_date = meta.get("scan_date", "")
@@ -129,7 +129,10 @@ def build_pdf(data: dict, output_path: str, charts_dir: str = ""):
     output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
     if os.path.lexists(output_dir) and os.path.islink(output_dir):
         raise OSError(f"refusing to write PDF to a symlinked directory: {output_dir}")
-    os.makedirs(output_dir, mode=0o700, exist_ok=True)
+    # Contain the temp file and the PDF under the output folder (see
+    # safe_io.containment_root) so a symlinked subfolder can't redirect either.
+    output_root = output_root or output_dir
+    safe_io.ensure_dir_within(output_dir, output_root, mode=0o700)
     temp_fd, temp_path = tempfile.mkstemp(prefix=".remediation-", suffix=".pdf", dir=output_dir)
     os.close(temp_fd)
     doc = SimpleDocTemplate(
@@ -385,7 +388,7 @@ def build_pdf(data: dict, output_path: str, charts_dir: str = ""):
     try:
         doc.build(E, onFirstPage=header_footer, onLaterPages=header_footer)
         with open(temp_path, "rb") as source:
-            with safe_io.open_write_nofollow(output_path, binary=True, root=output_dir) as dest:
+            with safe_io.open_write_nofollow(output_path, binary=True, root=output_root) as dest:
                 shutil.copyfileobj(source, dest)
     finally:
         if os.path.exists(temp_path):
@@ -400,7 +403,9 @@ def main():
     parser.add_argument("--charts", default="", help="Directory containing chart PNGs to embed")
     args = parser.parse_args()
     data = load_analysis(args.analysis_json)
-    build_pdf(data, args.output_pdf, args.charts)
+    build_pdf(data, args.output_pdf, args.charts,
+              output_root=safe_io.containment_root(
+                  args.output_pdf, os.path.dirname(args.analysis_json)))
 
 
 if __name__ == "__main__":

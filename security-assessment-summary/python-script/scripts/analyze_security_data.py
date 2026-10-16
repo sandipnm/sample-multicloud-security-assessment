@@ -43,7 +43,7 @@ import safe_io
 # per-file size we are willing to read.
 MAX_FIELD_BYTES = 16 * 1024 * 1024          # 16 MiB per CSV field (generous for Prowler)
 MAX_FILE_BYTES = 512 * 1024 * 1024          # 512 MiB per CSV/HTML input file
-MAX_JSON_FILE_BYTES = 32 * 1024 * 1024      # 32 MiB per JSON file (fully loaded into memory)
+MAX_JSON_FILE_BYTES = 256 * 1024 * 1024     # 256 MiB per JSON file (fully loaded into memory)
 MAX_HTML_FILE_BYTES = 32 * 1024 * 1024      # 32 MiB per HTML file (fully loaded into memory)
 MAX_CSV_HEADER_BYTES = 64 * 1024             # 64 KiB cap before CSV classification
 
@@ -53,7 +53,9 @@ MAX_TOTAL_FILES = 10_000                     # max files discovered/categorized 
 MAX_TOTAL_INPUT_PATHS = 50_000               # max files + directories visited in one run
 MAX_RECURSION_DEPTH = 32                     # max directory depth below the input root
 MAX_TOTAL_RECORDS = 5_000_000               # max normalized findings aggregated per run
-MAX_RECORDS_PER_FILE = 100_000               # per-file cap before parser lists grow unbounded
+# Per-file cap matches the aggregate cap: org-wide Prowler exports routinely hold several
+# hundred thousand rows, and silently analyzing a fraction would skew every score.
+MAX_RECORDS_PER_FILE = MAX_TOTAL_RECORDS
 
 try:
     csv.field_size_limit(MAX_FIELD_BYTES)
@@ -176,10 +178,27 @@ def _is_within(path: Path, parent: Path) -> bool:
         return False
 
 
+def _has_tool_artifacts(folder: Path) -> bool:
+    """True if ``folder`` holds any artifact this tool writes. analysis.json alone is not
+    enough: a run may write it elsewhere (custom output_json) while the dashboard,
+    README and Terraform still land in the folder."""
+    try:
+        if (folder / "analysis.json").is_file():
+            return True
+        if (folder / "iac" / ".cloud-sec-assessment-manifest.json").is_file():
+            return True
+        if any(folder.glob("*_README.md")):
+            return True
+        return any((folder / "reports").glob("*_Security_Dashboard.html"))
+    except OSError:
+        return False
+
+
 def _is_generated_output_file(filepath: Path, input_root: Path) -> bool:
     """True for files inside an assessment-summary* folder THIS TOOL created — one that
-    holds its analysis.json. A customer folder that merely shares the name (e.g.
-    ``assessment-summary-q3/`` with real scan files) is still read as input."""
+    holds its artifacts (see :func:`_has_tool_artifacts`). A customer folder that merely
+    shares the name (e.g. ``assessment-summary-q3/`` with real scan files) is still read
+    as input."""
     try:
         root = input_root.resolve()
         relative_parts = filepath.resolve().relative_to(root).parts[:-1]
@@ -189,7 +208,7 @@ def _is_generated_output_file(filepath: Path, input_root: Path) -> bool:
     for part in relative_parts:
         current = current / part
         if ((part == "assessment-summary" or part.startswith("assessment-summary-"))
-                and (current / "analysis.json").is_file()):
+                and _has_tool_artifacts(current)):
             return True
     return False
 
@@ -340,6 +359,15 @@ def identify_files(folder_path: str, excluded_roots: list = None,
                         f"input deeper than {MAX_RECURSION_DEPTH} folder levels skipped")
                     continue
                 if entry.is_dir(follow_symlinks=False):
+                    # Prune output folders here, once, so their files neither use up the
+                    # path budget nor cost a per-file resolve/ancestor check.
+                    if any(_is_within(f, root) for root in excluded_roots):
+                        continue
+                    if (exclude_generated_outputs
+                            and (f.name == "assessment-summary"
+                                 or f.name.startswith("assessment-summary-"))
+                            and _has_tool_artifacts(f)):
+                        continue
                     pending_dirs.append(f)
                     continue
                 # Only ordinary files are inputs. Do not open FIFOs, devices, or
@@ -1102,32 +1130,51 @@ _EMBEDDED_ID_PATTERNS = [
                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", re.IGNORECASE),
     re.compile(r"(ocid1\.(?:tenancy|compartment)\.[a-z0-9]+\.[a-z0-9-]*\.[a-z0-9]+)"),
 ]
-# GCP project IDs in resource-path form ("projects/<id>/..."), matched in any finding field.
+# GCP project IDs in resource-path form ("projects/<id>/..."), matched in GCP findings only.
 _GCP_PROJECT_PATTERN = re.compile(r"(?:^|[/\s\"'])projects/([a-z][a-z0-9-]{4,28}[a-z0-9])(?=/|$|\")")
 
 
 def _gcp_project_ids(text: str) -> set:
     """GCP project IDs in resource-path form (projects/<id>/...). Real IDs almost always
-    contain a digit or hyphen; requiring one avoids masking words like 'locations'."""
-    return {m for m in _GCP_PROJECT_PATTERN.findall(text)
-            if any(c.isdigit() or c == "-" for c in m)}
+    contain a digit or hyphen; requiring one avoids masking words like 'locations'.
+    Matches inside non-googleapis.com URLs are ignored: documentation links such as
+    .../gcloud/reference/projects/add-iam-policy-binding are not project IDs."""
+    found = set()
+    for m in _GCP_PROJECT_PATTERN.finditer(text):
+        project = m.group(1)
+        if not any(c.isdigit() or c == "-" for c in project):
+            continue
+        token_start = max(text.rfind(ch, 0, m.start(1)) for ch in " \t\r\n\"'") + 1
+        prefix = text[token_start:m.start(1)]
+        if "://" in prefix:
+            # API selfLinks (https://compute.googleapis.com/.../projects/<id>/...) DO name
+            # a project; any other URL is documentation.
+            host = prefix.split("://", 1)[1].split("/", 1)[0].lower()
+            if not host.endswith("googleapis.com"):
+                continue
+        found.add(project)
+    return found
+
 
 
 def extract_embedded_scope_ids(findings: list) -> set:
-    """Scope identifiers embedded in findings' resource IDs (and, for the specific
-    AWS/Azure/OCI patterns, anywhere in their text fields)."""
+    """Scope identifiers embedded anywhere in findings' text fields. The generic
+    projects/<id> form is only trusted in GCP findings: elsewhere it is far more likely
+    to be a path fragment than a scope."""
     found = set()
     for f in findings:
+        is_gcp = f.get("PROVIDER") == "gcp"
         for value in f.values():
             if not isinstance(value, str) or not value:
                 continue
             for pattern in _EMBEDDED_ID_PATTERNS:
                 found.update(pattern.findall(value))
-            found.update(_gcp_project_ids(value))
+            if is_gcp:
+                found.update(_gcp_project_ids(value))
     return found
 
 
-def verify_anonymization(obj, mapping: dict) -> list:
+def verify_anonymization(obj, mapping: dict, check_gcp: bool = True) -> list:
     """Return real identifiers still present anywhere in obj (should be empty): every
     known id, plus any provider-shaped id (ARN account, Azure subscription, OCI
     tenancy/compartment) that was never in the mapping."""
@@ -1136,7 +1183,8 @@ def verify_anonymization(obj, mapping: dict) -> list:
     labels = set(mapping.values())
     for pattern in _EMBEDDED_ID_PATTERNS:
         leaks.extend(m for m in pattern.findall(blob) if m not in labels and m not in leaks)
-    leaks.extend(m for m in _gcp_project_ids(blob) if m not in labels and m not in leaks)
+    if check_gcp:
+        leaks.extend(m for m in _gcp_project_ids(blob) if m not in labels and m not in leaks)
     return leaks
 
 
@@ -1483,7 +1531,8 @@ def main():
         # real account/subscription/project/tenancy IDs into the customer-facing file.)
         # The real->label mapping is written ONLY to the operator-side anon_map.json sidecar.
         output["metadata"]["scope_labels"] = sorted(mask.values())
-        leaks = verify_anonymization(output, mask)
+        leaks = verify_anonymization(
+            output, mask, check_gcp=any(f.get("PROVIDER") == "gcp" for f in all_findings))
         if leaks:
             print(f"ERROR: anonymization incomplete; {len(leaks)} identifier(s) "
                   "remain in the analysis. No output was written.", file=sys.stderr)

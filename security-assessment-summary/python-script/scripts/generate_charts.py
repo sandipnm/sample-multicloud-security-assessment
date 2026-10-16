@@ -40,9 +40,14 @@ def load_analysis(path: str) -> dict:
         return json.load(fh)
 
 
+# Output folder the charts are contained under (see safe_io.containment_root); set by
+# main(). None falls back to the chart's own folder.
+OUTPUT_ROOT = None
+
+
 def save_chart(output_path: str):
     """Write the active Matplotlib figure without following a planted output link."""
-    output_root = os.path.dirname(os.path.abspath(output_path)) or "."
+    output_root = OUTPUT_ROOT or os.path.dirname(os.path.abspath(output_path)) or "."
     with safe_io.open_write_nofollow(output_path, binary=True, root=output_root) as fh:
         plt.savefig(fh, dpi=150, bbox_inches="tight", transparent=True)
 
@@ -208,7 +213,10 @@ def main():
         print(f"ERROR: refusing to write charts to a symlinked directory: {args.output_dir}",
               file=sys.stderr)
         sys.exit(1)
-    os.makedirs(args.output_dir, mode=0o700, exist_ok=True)
+    global OUTPUT_ROOT
+    OUTPUT_ROOT = (safe_io.containment_root(args.output_dir, os.path.dirname(args.analysis_json))
+                   or args.output_dir)
+    safe_io.ensure_dir_within(args.output_dir, OUTPUT_ROOT, mode=0o700)
 
     summary = data["summary"]
     print("Generating charts for PPTX deck...")
